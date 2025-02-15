@@ -28,30 +28,29 @@ import java.util.Collection;
 import java.util.Set;
 import java.util.TreeSet;
 
+import org.graalvm.nativeimage.AnnotationAccess;
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.c.function.CFunction;
+
+import com.oracle.svm.core.AlwaysInline;
+import com.oracle.svm.core.NeverInline;
+import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.core.option.HostedOptionKey;
+import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.hosted.meta.HostedMethod;
+
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.java.AbstractNewObjectNode;
 import jdk.graal.compiler.nodes.java.MonitorEnterNode;
 import jdk.graal.compiler.nodes.java.NewMultiArrayNode;
 import jdk.graal.compiler.nodes.virtual.CommitAllocationNode;
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionsParser;
-import org.graalvm.nativeimage.AnnotationAccess;
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.c.function.CFunction;
-
-import com.oracle.svm.core.AlwaysInline;
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.os.RawFileOperationSupport;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.hosted.meta.HostedMethod;
-
+import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /** Checks that {@linkplain Uninterruptible} has been used consistently. */
@@ -72,9 +71,9 @@ public final class UninterruptibleAnnotationChecker {
     UninterruptibleAnnotationChecker() {
     }
 
-    public static void checkAfterParsing(ResolvedJavaMethod method, StructuredGraph graph) {
+    public static void checkAfterParsing(ResolvedJavaMethod method, StructuredGraph graph, ConstantReflectionProvider constantReflectionProvider) {
         if (Uninterruptible.Utils.isUninterruptible(method) && graph != null) {
-            singleton().checkGraph(method, graph);
+            singleton().checkGraph(method, graph, constantReflectionProvider);
         }
     }
 
@@ -111,7 +110,7 @@ public final class UninterruptibleAnnotationChecker {
     }
 
     private void checkSpecifiedOptions(HostedMethod method, Uninterruptible annotation) {
-        if (annotation == null || !useStrictChecking()) {
+        if (annotation == null) {
             return;
         }
 
@@ -168,17 +167,6 @@ public final class UninterruptibleAnnotationChecker {
         return OptionsParser.stringSimilarity(Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, reason) > 0.75;
     }
 
-    private static boolean useStrictChecking() {
-        if (SubstrateOptions.AllowVMInternalThreads.getValue()) {
-            return true;
-        }
-        /*
-         * Use less strict checking for certain legacy code. The strict checking activates once a
-         * custom RawFileOperationSupport is implemented (see GR-44538).
-         */
-        return RawFileOperationSupport.isPresent() && !Platform.includedIn(Platform.LINUX.class);
-    }
-
     /**
      * Check that each method annotated with {@linkplain Uninterruptible} is overridden with
      * implementations that are also annotated with {@linkplain Uninterruptible}, with the same
@@ -196,7 +184,9 @@ public final class UninterruptibleAnnotationChecker {
             Uninterruptible implAnnotation = Uninterruptible.Utils.getAnnotation(impl);
             if (implAnnotation != null) {
                 if (methodAnnotation.callerMustBe() != implAnnotation.callerMustBe()) {
-                    violations.add("callerMustBe: " + method.format("%H.%n(%p):%r") + " != " + impl.format("%H.%n(%p):%r"));
+                    // GR-45784: temporarily disabled so that we can remove legacy code
+                    // violations.add("callerMustBe: " + method.format("%H.%n(%p):%r") + " != " +
+                    // impl.format("%H.%n(%p):%r"));
                 }
                 if (methodAnnotation.calleeMustBe() != implAnnotation.calleeMustBe()) {
                     violations.add("calleeMustBe: " + method.format("%H.%n(%p):%r") + " != " + impl.format("%H.%n(%p):%r"));
@@ -266,7 +256,7 @@ public final class UninterruptibleAnnotationChecker {
         }
     }
 
-    private void checkGraph(ResolvedJavaMethod method, StructuredGraph graph) {
+    private void checkGraph(ResolvedJavaMethod method, StructuredGraph graph, ConstantReflectionProvider constantReflectionProvider) {
         Uninterruptible annotation = Uninterruptible.Utils.getAnnotation(method);
         for (Node node : graph.getNodes()) {
             if (isAllocationNode(node)) {
@@ -279,7 +269,10 @@ public final class UninterruptibleAnnotationChecker {
                  * It is therefore safe to have class initialization nodes in methods that are
                  * annotated with calleeMustBe = false.
                  */
-                violations.add("Uninterruptible method " + method.format("%H.%n(%p)") + " is not allowed to do class initialization.");
+                ValueNode hub = ((EnsureClassInitializedNode) node).getHub();
+
+                var culprit = hub.isConstant() ? constantReflectionProvider.asJavaType(hub.asConstant()).toClassName() : "unknown";
+                violations.add("Uninterruptible method " + method.format("%H.%n(%p)") + " is not allowed to do class initialization. Initialized type: " + culprit);
             }
         }
     }

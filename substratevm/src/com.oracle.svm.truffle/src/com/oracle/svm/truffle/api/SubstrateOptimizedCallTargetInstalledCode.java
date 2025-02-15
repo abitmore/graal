@@ -26,9 +26,7 @@ package com.oracle.svm.truffle.api;
 
 import java.lang.ref.WeakReference;
 
-import jdk.graal.compiler.core.common.CompilationIdentifier;
-import jdk.graal.compiler.truffle.TruffleCompilerImpl;
-import org.graalvm.word.WordFactory;
+import jdk.graal.compiler.word.Word;
 
 import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.code.CodeInfo;
@@ -44,6 +42,8 @@ import com.oracle.svm.core.util.VMError;
 import com.oracle.truffle.compiler.OptimizedAssumptionDependency;
 import com.oracle.truffle.compiler.TruffleCompilable;
 
+import jdk.graal.compiler.core.common.CompilationIdentifier;
+import jdk.graal.compiler.truffle.TruffleCompilerImpl;
 import jdk.vm.ci.code.InstalledCode;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
@@ -105,10 +105,10 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
     }
 
     /**
-     * Returns false if not valid, including if {@linkplain #invalidateWithoutDeoptimization
-     * previously invalidated without deoptimization} in which case there can still be
-     * {@linkplain #isAlive live activations}. In order to entirely invalidate code in such cases,
-     * {@link #invalidate} must still be called even when this method returns false.
+     * Returns false if not valid, including if {@linkplain #makeNonEntrant previously made
+     * non-entrant} in which case there can still be {@linkplain #isAlive live activations}. In
+     * order to entirely invalidate code in such cases, {@link #invalidate} must still be called
+     * even when this method returns false.
      */
     @Override
     public boolean isValid() {
@@ -187,19 +187,19 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
     }
 
     @Override
-    public void invalidateWithoutDeoptimization() {
+    public void makeNonEntrant() {
         assert VMOperation.isInProgressAtSafepoint();
         if (isValid()) {
-            invalidateWithoutDeoptimization0();
+            makeNonEntrant0();
         }
     }
 
     @Uninterruptible(reason = "Must tether the CodeInfo.")
-    private void invalidateWithoutDeoptimization0() {
+    private void makeNonEntrant0() {
         this.entryPoint = 0;
 
-        UntetheredCodeInfo untetheredInfo = CodeInfoTable.lookupCodeInfo(WordFactory.pointer(this.address));
-        assert untetheredInfo.isNonNull() && untetheredInfo.notEqual(CodeInfoTable.getImageCodeInfo());
+        UntetheredCodeInfo untetheredInfo = CodeInfoTable.lookupCodeInfo(Word.pointer(this.address));
+        assert untetheredInfo.isNonNull() && !UntetheredCodeInfoAccess.isAOTImageCode(untetheredInfo);
 
         Object tether = CodeInfoAccess.acquireTether(untetheredInfo);
         try { // Indicates to GC that the code can be freed once there are no activations left
@@ -226,7 +226,7 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
          */
         long start = callTarget.installedCode.entryPoint;
         if (start != 0) {
-            SubstrateOptimizedCallTarget.CallBoundaryFunctionPointer target = WordFactory.pointer(start);
+            SubstrateOptimizedCallTarget.CallBoundaryFunctionPointer target = Word.pointer(start);
             return target.invoke(callTarget, args);
         } else {
             return callTarget.invokeCallBoundary(args);
@@ -238,8 +238,8 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
         if (entryPoint == 0) {
             return false; // not valid
         }
-        UntetheredCodeInfo info = CodeInfoTable.lookupCodeInfo(WordFactory.pointer(entryPoint));
-        return info.isNonNull() && info.notEqual(CodeInfoTable.getImageCodeInfo()) &&
+        UntetheredCodeInfo info = CodeInfoTable.lookupCodeInfo(Word.pointer(entryPoint));
+        return info.isNonNull() && !UntetheredCodeInfoAccess.isAOTImageCode(info) &&
                         UntetheredCodeInfoAccess.getTier(info) == TruffleCompilerImpl.LAST_TIER_INDEX;
     }
 
