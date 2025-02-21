@@ -24,10 +24,11 @@
  */
 package com.oracle.svm.core;
 
+import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 import static com.oracle.svm.core.option.RuntimeOptionKey.RuntimeOptionKeyFlag.RelevantForCompilationIsolates;
 
-import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.nativeimage.CurrentIsolate;
@@ -43,8 +44,12 @@ import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
+import com.oracle.svm.core.SubstrateDiagnostics.DiagnosticThunkRegistry;
+import com.oracle.svm.core.SubstrateDiagnostics.DumpCodeCacheHistory;
+import com.oracle.svm.core.SubstrateDiagnostics.DumpDeoptStubPointer;
+import com.oracle.svm.core.SubstrateDiagnostics.DumpRecentDeoptimizations;
+import com.oracle.svm.core.SubstrateDiagnostics.DumpRuntimeCodeInfoMemory;
 import com.oracle.svm.core.c.NonmovableArrays;
 import com.oracle.svm.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
@@ -53,32 +58,32 @@ import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.code.FrameInfoQueryResult;
 import com.oracle.svm.core.code.RuntimeCodeInfoHistory;
 import com.oracle.svm.core.code.RuntimeCodeInfoMemory;
-import com.oracle.svm.core.code.UntetheredCodeInfo;
 import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.container.Container;
+import com.oracle.svm.core.container.OperatingSystem;
 import com.oracle.svm.core.deopt.DeoptimizationSupport;
-import com.oracle.svm.core.deopt.DeoptimizedFrame;
 import com.oracle.svm.core.deopt.Deoptimizer;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.RuntimeCompilation;
 import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
 import com.oracle.svm.core.heap.Heap;
-import com.oracle.svm.core.heap.PhysicalMemory;
 import com.oracle.svm.core.heap.RestrictHeapAccess;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.hub.LayoutEncoding;
-import com.oracle.svm.core.jdk.Jvm;
 import com.oracle.svm.core.jdk.UninterruptibleUtils;
 import com.oracle.svm.core.jdk.UninterruptibleUtils.AtomicWord;
 import com.oracle.svm.core.locks.VMLockSupport;
 import com.oracle.svm.core.log.Log;
 import com.oracle.svm.core.option.RuntimeOptionKey;
 import com.oracle.svm.core.os.VirtualMemoryProvider;
+import com.oracle.svm.core.snippets.KnownIntrinsics;
 import com.oracle.svm.core.stack.JavaFrameAnchor;
 import com.oracle.svm.core.stack.JavaFrameAnchors;
 import com.oracle.svm.core.stack.JavaStackWalker;
 import com.oracle.svm.core.stack.ThreadStackPrinter;
 import com.oracle.svm.core.stack.ThreadStackPrinter.StackFramePrintVisitor;
-import com.oracle.svm.core.stack.ThreadStackPrinter.Stage0StackFramePrintVisitor;
-import com.oracle.svm.core.stack.ThreadStackPrinter.Stage1StackFramePrintVisitor;
 import com.oracle.svm.core.thread.PlatformThreads;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.core.thread.VMOperationControl;
@@ -88,6 +93,7 @@ import com.oracle.svm.core.threadlocal.FastThreadLocalBytes;
 import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
 import com.oracle.svm.core.threadlocal.VMThreadLocalInfos;
 import com.oracle.svm.core.util.CounterSupport;
+import com.oracle.svm.core.util.ImageHeapList;
 import com.oracle.svm.core.util.TimeUtils;
 import com.oracle.svm.core.util.VMError;
 
@@ -108,10 +114,7 @@ public class SubstrateDiagnostics {
 
     private static final FastThreadLocalBytes<CCharPointer> threadOnlyAttachedForCrashHandler = FastThreadLocalFactory.createBytes(() -> 1, "SubstrateDiagnostics.threadOnlyAttachedForCrashHandler");
     private static final ImageCodeLocationInfoPrinter imageCodeLocationInfoPrinter = new ImageCodeLocationInfoPrinter();
-    private static final Stage0StackFramePrintVisitor[] printVisitors = new Stage0StackFramePrintVisitor[]{new StackFramePrintVisitor(), new Stage1StackFramePrintVisitor(),
-                    new Stage0StackFramePrintVisitor()};
-
-    private static volatile boolean loopOnFatalError;
+    private static final StackFramePrintVisitor stackFramePrinter = new StackFramePrintVisitor();
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static void setOnlyAttachedForCrashHandler(IsolateThread thread) {
@@ -192,8 +195,8 @@ public class SubstrateDiagnostics {
         int maxPrintedBytes = elementSize == 1 ? 8 : 16;
         int printedElements = UninterruptibleUtils.Math.min(length, maxPrintedBytes / elementSize);
 
-        UnsignedWord curOffset = WordFactory.unsigned(arrayBaseOffset);
-        UnsignedWord endOffset = curOffset.add(WordFactory.unsigned(printedElements).multiply(elementSize));
+        UnsignedWord curOffset = Word.unsigned(arrayBaseOffset);
+        UnsignedWord endOffset = curOffset.add(Word.unsigned(printedElements).multiply(elementSize));
         while (curOffset.belowThan(endOffset)) {
             switch (elementSize) {
                 case 1 -> log.zhex(ObjectAccess.readByte(obj, curOffset));
@@ -215,7 +218,7 @@ public class SubstrateDiagnostics {
      * See {@link #printInformation(Log, Pointer, CodePointer, RegisterDumper.Context, boolean)}.
      */
     public static void printInformation(Log log, Pointer sp, CodePointer ip) {
-        printInformation(log, sp, ip, WordFactory.nullPointer(), false);
+        printInformation(log, sp, ip, Word.nullPointer(), false);
     }
 
     /**
@@ -248,7 +251,7 @@ public class SubstrateDiagnostics {
      * See {@link #printFatalError(Log, Pointer, CodePointer, RegisterDumper.Context, boolean)}.
      */
     public static boolean printFatalError(Log log, Pointer sp, CodePointer ip) {
-        return printFatalError(log, sp, ip, WordFactory.nullPointer(), false);
+        return printFatalError(log, sp, ip, Word.nullPointer(), false);
     }
 
     /**
@@ -273,7 +276,7 @@ public class SubstrateDiagnostics {
          * In the debugger, it is possible to change the value of loopOnFatalError to false if
          * necessary.
          */
-        while (loopOnFatalError) {
+        while (Options.shouldLoopOnFatalError()) {
             PauseNode.pause();
         }
 
@@ -371,35 +374,11 @@ public class SubstrateDiagnostics {
         log.resetIndentation().newline();
     }
 
-    @Uninterruptible(reason = "Prevent deoptimization of stack frames while in this method.")
-    private static long getTotalFrameSize(Pointer sp, CodePointer ip) {
-        DeoptimizedFrame deoptFrame = Deoptimizer.checkDeoptimized(sp);
-        if (deoptFrame != null) {
-            return deoptFrame.getSourceTotalFrameSize();
-        }
-
-        UntetheredCodeInfo untetheredInfo = CodeInfoTable.lookupCodeInfo(ip);
-        if (untetheredInfo.isNonNull()) {
-            Object tether = CodeInfoAccess.acquireTether(untetheredInfo);
-            try {
-                CodeInfo codeInfo = CodeInfoAccess.convert(untetheredInfo, tether);
-                return getTotalFrameSize0(ip, codeInfo);
-            } finally {
-                CodeInfoAccess.releaseTether(untetheredInfo, tether);
-            }
-        }
-        return -1;
-    }
-
-    @Uninterruptible(reason = "Wrap the now safe call to interruptibly look up the frame size.", calleeMustBe = false)
-    private static long getTotalFrameSize0(CodePointer ip, CodeInfo codeInfo) {
-        return CodeInfoAccess.lookupTotalFrameSize(codeInfo, CodeInfoAccess.relativeIP(codeInfo, ip));
-    }
-
     private static void logFrameAnchors(Log log, IsolateThread thread) {
         JavaFrameAnchor anchor = JavaFrameAnchors.getFrameAnchor(thread);
         if (anchor.isNull()) {
             log.string("No anchors").newline();
+            return;
         }
 
         int printed = 0;
@@ -524,7 +503,7 @@ public class SubstrateDiagnostics {
             }
             pos = pos.add(wordSize);
         }
-        return WordFactory.nullPointer();
+        return Word.nullPointer();
     }
 
     @Uninterruptible(reason = "Prevent the GC from freeing the CodeInfo.")
@@ -556,7 +535,7 @@ public class SubstrateDiagnostics {
 
         @SuppressWarnings("hiding")
         public boolean trySet(Log log, Pointer sp, CodePointer ip, RegisterDumper.Context registerContext, boolean frameHasCalleeSavedRegisters) {
-            if (diagnosticThread.compareAndSet(WordFactory.nullPointer(), CurrentIsolate.getCurrentThread())) {
+            if (diagnosticThread.compareAndSet(Word.nullPointer(), CurrentIsolate.getCurrentThread())) {
                 assert diagnosticThunkIndex == -1;
                 assert invocationCount == 0;
                 this.log = log;
@@ -575,19 +554,19 @@ public class SubstrateDiagnostics {
             log = null;
 
             ErrorContext errorContext = getErrorContext();
-            errorContext.setStackPointer(WordFactory.nullPointer());
-            errorContext.setInstructionPointer(WordFactory.nullPointer());
-            errorContext.setRegisterContext(WordFactory.nullPointer());
+            errorContext.setStackPointer(Word.nullPointer());
+            errorContext.setInstructionPointer(Word.nullPointer());
+            errorContext.setRegisterContext(Word.nullPointer());
             errorContext.setFrameHasCalleeSavedRegisters(false);
 
             diagnosticThunkIndex = -1;
             invocationCount = 0;
 
-            diagnosticThread.set(WordFactory.nullPointer());
+            diagnosticThread.set(Word.nullPointer());
         }
     }
 
-    private static class DumpRegisters extends DiagnosticThunk {
+    private static final class DumpRegisters extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 4;
@@ -609,7 +588,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpInstructions extends DiagnosticThunk {
+    private static final class DumpInstructions extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 4;
@@ -657,7 +636,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpTopOfCurrentThreadStack extends DiagnosticThunk {
+    private static final class DumpTopOfCurrentThreadStack extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 1;
@@ -705,7 +684,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpDeoptStubPointer extends DiagnosticThunk {
+    static class DumpDeoptStubPointer extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 1;
@@ -714,37 +693,16 @@ public class SubstrateDiagnostics {
         @Override
         @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while printing diagnostics.")
         public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
-            log.string("DeoptStubPointer address: ").zhex(DeoptimizationSupport.getDeoptStubPointer()).newline().newline();
-        }
-    }
-
-    private static class DumpTopDeoptimizedFrame extends DiagnosticThunk {
-        @Override
-        public int maxInvocationCount() {
-            return 1;
-        }
-
-        @Override
-        @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while printing diagnostics.")
-        public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
-            Pointer sp = context.getStackPointer();
-            CodePointer ip = context.getInstructionPointer();
-
-            if (sp.isNonNull() && ip.isNonNull()) {
-                long totalFrameSize = getTotalFrameSize(sp, ip);
-                DeoptimizedFrame deoptFrame = Deoptimizer.checkDeoptimized(sp);
-                if (deoptFrame != null) {
-                    log.string("Top frame info:").indent(true);
-                    log.string("RSP ").zhex(sp).string(" frame was deoptimized:").newline();
-                    log.string("SourcePC ").zhex(deoptFrame.getSourcePC()).newline();
-                    log.string("SourceTotalFrameSize ").signed(totalFrameSize).newline();
-                    log.indent(false);
-                }
+            log.string("EagerDeoptStub address: ").zhex(DeoptimizationSupport.getEagerDeoptStubPointer()).newline();
+            if (Deoptimizer.Options.LazyDeoptimization.getValue()) {
+                log.string("LazyDeoptStubPrimitiveReturn address: ").zhex(DeoptimizationSupport.getLazyDeoptStubPrimitiveReturnPointer()).newline();
+                log.string("LazyDeoptStubObjectReturn address: ").zhex(DeoptimizationSupport.getLazyDeoptStubObjectReturnPointer()).newline();
             }
+            log.newline();
         }
     }
 
-    private static class DumpThreads extends DiagnosticThunk {
+    private static final class DumpThreads extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 3;
@@ -795,7 +753,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpCurrentThreadLocals extends DiagnosticThunk {
+    private static final class DumpCurrentThreadLocals extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 2;
@@ -819,7 +777,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpCurrentVMOperation extends DiagnosticThunk {
+    private static final class DumpCurrentVMOperation extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 2;
@@ -834,7 +792,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpVMOperationHistory extends DiagnosticThunk {
+    private static final class DumpVMOperationHistory extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 2;
@@ -848,7 +806,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpCodeCacheHistory extends DiagnosticThunk {
+    static class DumpCodeCacheHistory extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 2;
@@ -862,7 +820,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpRuntimeCodeInfoMemory extends DiagnosticThunk {
+    static class DumpRuntimeCodeInfoMemory extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 3;
@@ -877,7 +835,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpRecentDeoptimizations extends DiagnosticThunk {
+    static class DumpRecentDeoptimizations extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 1;
@@ -890,7 +848,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    static class DumpVMInfo extends DiagnosticThunk {
+    static class DumpBuildTimeInfo extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 1;
@@ -902,12 +860,14 @@ public class SubstrateDiagnostics {
             log.string("Build time information:").indent(true);
 
             VM vm = ImageSingletons.lookup(VM.class);
-            log.string("Version: ").string(vm.version).string(", ").string(vm.info).newline();
+            log.string("Version: ").string(vm.vendorVersion).string(" (").string(vm.info).string("), JDK ").string(vm.version).newline();
 
             Platform platform = ImageSingletons.lookup(Platform.class);
             log.string("Platform: ").string(platform.getOS()).string("/").string(platform.getArchitecture()).newline();
             log.string("Page size: ").unsigned(SubstrateOptions.getPageSize()).newline();
-            log.string("Container support: ").bool(Containers.Options.UseContainerSupport.getValue()).newline();
+            log.string("Supports isolates: ").bool(SubstrateOptions.SpawnIsolates.getValue()).newline();
+            log.string("Containerized: ").string(String.valueOf(Container.singleton().isContainerized())).newline();
+            log.string("Object reference size: ").signed(ConfigurationValues.getObjectLayout().getReferenceSize()).newline();
             log.string("CPU features used for AOT compiled code: ").string(getBuildTimeCpuFeatures()).newline();
             log.indent(false);
         }
@@ -918,7 +878,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    public static class DumpMachineInfo extends DiagnosticThunk {
+    public static class DumpRuntimeInfo extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 1;
@@ -928,44 +888,99 @@ public class SubstrateDiagnostics {
         @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while printing diagnostics.")
         public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
             log.string("Runtime information:").indent(true);
+            log.string("Isolate id: ").signed(Isolates.getIsolateId()).newline();
+            log.string("Heap base: ").zhex(KnownIntrinsics.heapBase()).newline();
 
-            int activeProcessorCount = Processor.singleton().getLastQueriedActiveProcessorCount();
-            log.string("CPU cores (container): ");
-            if (activeProcessorCount > 0) {
-                log.signed(activeProcessorCount).newline();
-            } else {
-                log.string("unknown").newline();
+            if (Container.singleton().isContainerized()) {
+                log.string("CPU cores (container): ");
+                int processorCount = getContainerActiveProcessorCount();
+                if (processorCount > 0) {
+                    log.signed(processorCount).newline();
+                } else {
+                    log.string("unknown").newline();
+                }
             }
 
             log.string("CPU cores (OS): ");
-            if (SubstrateOptions.JNI.getValue()) {
-                log.signed(Jvm.JVM_ActiveProcessorCount()).newline();
+            int processorCount = getOsProcessorCount();
+            if (processorCount > 0) {
+                log.signed(processorCount).newline();
             } else {
                 log.string("unknown").newline();
             }
 
-            log.string("Memory: ");
-            if (PhysicalMemory.isInitialized()) {
-                log.rational(PhysicalMemory.getCachedSize(), 1024 * 1024, 0).string("M").newline();
+            if (Container.singleton().isContainerized()) {
+                log.string("Memory (container): ");
+                UnsignedWord memory = getContainerPhysicalMemory();
+                if (memory.aboveThan(0)) {
+                    log.rational(memory, 1024 * 1024, 0).string("M").newline();
+                } else {
+                    log.string("unknown").newline();
+                }
+            }
+
+            log.string("Memory (OS): ");
+            UnsignedWord memory = getOsPhysicalMemorySize();
+            if (memory.aboveThan(0)) {
+                log.rational(memory, 1024 * 1024, 0).string("M").newline();
             } else {
                 log.string("unknown").newline();
             }
 
             log.string("Page size: ").unsigned(VirtualMemoryProvider.get().getGranularity()).newline();
-            log.string("VM uptime: ").rational(Isolates.getCurrentUptimeMillis(), TimeUtils.millisPerSecond, 3).string("s").newline();
-            log.string("Current timestamp: ").unsigned(System.currentTimeMillis()).newline();
+            if (!SubstrateOptions.AsyncSignalSafeDiagnostics.getValue()) {
+                log.string("VM uptime: ").rational(Isolates.getUptimeMillis(), TimeUtils.millisPerSecond, 3).string("s").newline();
+                log.string("Current timestamp: ").unsigned(TimeUtils.currentTimeMillis()).newline();
+            }
 
-            CodeInfo info = CodeInfoTable.getImageCodeInfo();
-            Pointer codeStart = (Pointer) CodeInfoAccess.getCodeStart(info);
-            UnsignedWord codeSize = CodeInfoAccess.getCodeSize(info);
-            Pointer codeEnd = codeStart.add(codeSize).subtract(1);
-            log.string("AOT compiled code: ").zhex(codeStart).string(" - ").zhex(codeEnd).newline();
+            CodeInfo info = CodeInfoTable.getFirstImageCodeInfo();
+            do {
+                Pointer codeStart = (Pointer) CodeInfoAccess.getCodeStart(info);
+                UnsignedWord codeSize = CodeInfoAccess.getCodeSize(info);
+                Pointer codeEnd = codeStart.add(codeSize).subtract(1);
+                log.string("AOT compiled code: ").zhex(codeStart).string(" - ").zhex(codeEnd).newline();
+                info = CodeInfoAccess.getNextImageCodeInfo(info);
+            } while (info.isNonNull());
 
             log.indent(false);
         }
+
+        private static int getOsProcessorCount() {
+            if (SubstrateOptions.AsyncSignalSafeDiagnostics.getValue()) {
+                return OperatingSystem.singleton().getCachedActiveProcessorCount();
+            } else if (SubstrateOptions.JNI.getValue()) {
+                return OperatingSystem.singleton().getActiveProcessorCount();
+            } else {
+                return -1;
+            }
+        }
+
+        private static UnsignedWord getOsPhysicalMemorySize() {
+            if (SubstrateOptions.AsyncSignalSafeDiagnostics.getValue()) {
+                return OperatingSystem.singleton().getCachedPhysicalMemorySize();
+            } else {
+                return OperatingSystem.singleton().getPhysicalMemorySize();
+            }
+        }
+
+        private static int getContainerActiveProcessorCount() {
+            if (SubstrateOptions.AsyncSignalSafeDiagnostics.getValue()) {
+                return Container.singleton().getCachedActiveProcessorCount();
+            } else {
+                return Container.singleton().getActiveProcessorCount();
+            }
+        }
+
+        private static UnsignedWord getContainerPhysicalMemory() {
+            if (SubstrateOptions.AsyncSignalSafeDiagnostics.getValue()) {
+                return Container.singleton().getCachedPhysicalMemory();
+            } else {
+                return Container.singleton().getPhysicalMemory();
+            }
+        }
     }
 
-    private static class DumpCounters extends DiagnosticThunk {
+    private static final class DumpCounters extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 1;
@@ -983,7 +998,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpCurrentThreadFrameAnchors extends DiagnosticThunk {
+    private static final class DumpCurrentThreadFrameAnchors extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 1;
@@ -999,7 +1014,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class DumpCurrentThreadDecodedStackTrace extends DiagnosticThunk {
+    private static final class DumpCurrentThreadDecodedStackTrace extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 3;
@@ -1011,8 +1026,8 @@ public class SubstrateDiagnostics {
             Pointer sp = context.getStackPointer();
             CodePointer ip = context.getInstructionPointer();
 
-            log.string("Stacktrace for the failing thread ").zhex(CurrentIsolate.getCurrentThread()).string(" (A=AOT compiled, J=JIT compiled, D=deoptimized, i=inlined):").indent(true);
-            boolean success = ThreadStackPrinter.printStacktrace(sp, ip, printVisitors[invocationCount - 1].reset(), log);
+            log.string("Stacktrace for the failing thread ").zhex(CurrentIsolate.getCurrentThread()).string(" (A=AOT compiled, J=JIT compiled, D=deoptimized, i=inlined, C=native):").indent(true);
+            boolean success = ThreadStackPrinter.printStacktrace(CurrentIsolate.getCurrentThread(), sp, ip, stackFramePrinter.reset(invocationCount), log);
 
             if (!success && DiagnosticLevel.unsafeOperationsAllowed(maxDiagnosticLevel)) {
                 /*
@@ -1043,11 +1058,11 @@ public class SubstrateDiagnostics {
             Pointer sp = returnAddressPos.add(FrameAccess.returnAddressSize());
             log.newline();
             log.string("Starting the stack walk in a possible caller (sp + ").unsigned(sp.subtract(originalSp)).string("):").newline();
-            ThreadStackPrinter.printStacktrace(sp, possibleIp, printVisitors[invocationCount - 1].reset(), log);
+            ThreadStackPrinter.printStacktrace(CurrentIsolate.getCurrentThread(), sp, possibleIp, stackFramePrinter.reset(invocationCount), log);
         }
     }
 
-    private static class DumpOtherStackTraces extends DiagnosticThunk {
+    private static final class DumpOtherStackTraces extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 3;
@@ -1090,12 +1105,12 @@ public class SubstrateDiagnostics {
 
         private static void printStackTrace(Log log, IsolateThread vmThread, int invocationCount) {
             log.string("Stacktrace:").indent(true);
-            JavaStackWalker.walkThread(vmThread, printVisitors[invocationCount - 1].reset(), log);
+            JavaStackWalker.walkThread(vmThread, stackFramePrinter.reset(invocationCount), log);
             log.redent(false);
         }
     }
 
-    private static class DumpCommandLine extends DiagnosticThunk {
+    private static final class DumpCommandLine extends DiagnosticThunk {
         @Override
         public int maxInvocationCount() {
             return 1;
@@ -1115,7 +1130,7 @@ public class SubstrateDiagnostics {
         }
     }
 
-    private static class ImageCodeLocationInfoPrinter {
+    private static final class ImageCodeLocationInfoPrinter {
         private final CodeInfoDecoder.FrameInfoCursor frameInfoCursor = new CodeInfoDecoder.FrameInfoCursor();
 
         /**
@@ -1125,25 +1140,28 @@ public class SubstrateDiagnostics {
          * NOTE: this method may only be called by a single thread.
          */
         public boolean printLocationInfo(Log log, UnsignedWord value) {
-            CodeInfo imageCodeInfo = CodeInfoTable.getImageCodeInfo();
-            if (imageCodeInfo.equal(value)) {
-                log.string("is the image CodeInfo object");
-                return true;
-            }
-
-            UnsignedWord codeInfoEnd = ((UnsignedWord) imageCodeInfo).add(CodeInfoAccess.getSizeOfCodeInfo());
-            if (value.aboveOrEqual((UnsignedWord) imageCodeInfo) && value.belowThan(codeInfoEnd)) {
-                log.string("points inside the image CodeInfo object ").zhex(imageCodeInfo);
-                return true;
-            }
-
-            if (CodeInfoAccess.contains(imageCodeInfo, (CodePointer) value)) {
-                log.string("points into AOT compiled code ");
-                FrameInfoQueryResult compilationRoot = getCompilationRoot(imageCodeInfo, (CodePointer) value);
-                if (compilationRoot != null) {
-                    compilationRoot.log(log);
+            CodeInfo imageCodeInfo = CodeInfoTable.getFirstImageCodeInfo();
+            while (imageCodeInfo.isNonNull()) {
+                if (imageCodeInfo.equal(value)) {
+                    log.string("is an image CodeInfo object");
+                    return true;
                 }
-                return true;
+
+                UnsignedWord codeInfoEnd = ((UnsignedWord) imageCodeInfo).add(CodeInfoAccess.getSizeOfCodeInfo());
+                if (value.aboveOrEqual((UnsignedWord) imageCodeInfo) && value.belowThan(codeInfoEnd)) {
+                    log.string("points inside the image CodeInfo object ").zhex(imageCodeInfo);
+                    return true;
+                }
+
+                if (CodeInfoAccess.contains(imageCodeInfo, (CodePointer) value)) {
+                    log.string("points into AOT compiled code ");
+                    FrameInfoQueryResult compilationRoot = getCompilationRoot(imageCodeInfo, (CodePointer) value);
+                    if (compilationRoot != null) {
+                        compilationRoot.log(log);
+                    }
+                    return true;
+                }
+                imageCodeInfo = CodeInfoAccess.getNextImageCodeInfo(imageCodeInfo);
             }
 
             return false;
@@ -1235,11 +1253,15 @@ public class SubstrateDiagnostics {
     }
 
     public static class DiagnosticThunkRegistry {
-        private DiagnosticThunk[] diagnosticThunks;
+        @Platforms(Platform.HOSTED_ONLY.class) //
+        final int runtimeCompilationPosition;
+
+        private final List<DiagnosticThunk> thunks = ImageHeapList.create(DiagnosticThunk.class);
         private int[] initialInvocationCount;
 
         @Fold
         public static synchronized DiagnosticThunkRegistry singleton() {
+            /* The registry is already used very early during the image build. */
             if (!ImageSingletons.contains(DiagnosticThunkRegistry.class)) {
                 ImageSingletons.add(DiagnosticThunkRegistry.class, new DiagnosticThunkRegistry());
             }
@@ -1248,13 +1270,9 @@ public class SubstrateDiagnostics {
 
         @Platforms(Platform.HOSTED_ONLY.class)
         DiagnosticThunkRegistry() {
-            ArrayList<DiagnosticThunk> thunks = new ArrayList<>();
             thunks.add(new DumpRegisters());
             thunks.add(new DumpInstructions());
             thunks.add(new DumpTopOfCurrentThreadStack());
-            if (RuntimeCompilation.isEnabled()) {
-                thunks.add(new DumpTopDeoptimizedFrame());
-            }
             thunks.add(new DumpCurrentThreadLocals());
             thunks.add(new DumpCurrentThreadFrameAnchors());
             thunks.add(new DumpCurrentThreadDecodedStackTrace());
@@ -1263,51 +1281,51 @@ public class SubstrateDiagnostics {
             thunks.add(new DumpCurrentVMOperation());
             thunks.add(new DumpVMOperationHistory());
             thunks.add(new VMLockSupport.DumpVMMutexes());
-            thunks.add(new DumpVMInfo());
-            thunks.add(new DumpMachineInfo());
+            thunks.add(new DumpBuildTimeInfo());
+            thunks.add(new DumpRuntimeInfo());
             if (ImageSingletons.contains(JavaMainWrapper.JavaMainSupport.class)) {
                 thunks.add(new DumpCommandLine());
             }
-            thunks.add(new DumpCounters());
-            if (RuntimeCompilation.isEnabled()) {
-                thunks.add(new DumpCodeCacheHistory());
-                thunks.add(new DumpRuntimeCodeInfoMemory());
-                thunks.add(new DumpDeoptStubPointer());
-                thunks.add(new DumpRecentDeoptimizations());
+            if (CounterSupport.isEnabled()) {
+                thunks.add(new DumpCounters());
             }
 
-            this.diagnosticThunks = thunks.toArray(new DiagnosticThunk[0]);
-            this.initialInvocationCount = new int[diagnosticThunks.length];
-            Arrays.fill(initialInvocationCount, 1);
+            resizeInitialInvocationCount();
+            this.runtimeCompilationPosition = thunks.size();
         }
 
         @Platforms(Platform.HOSTED_ONLY.class)
         public synchronized void add(DiagnosticThunk thunk) {
-            diagnosticThunks = Arrays.copyOf(diagnosticThunks, diagnosticThunks.length + 1);
-            diagnosticThunks[diagnosticThunks.length - 1] = thunk;
+            thunks.add(thunk);
+            resizeInitialInvocationCount();
+        }
 
-            initialInvocationCount = Arrays.copyOf(initialInvocationCount, initialInvocationCount.length + 1);
-            initialInvocationCount[initialInvocationCount.length - 1] = 1;
+        @Platforms(Platform.HOSTED_ONLY.class)
+        public synchronized void add(int insertPos, DiagnosticThunk... extraThunks) {
+            for (int i = 0; i < extraThunks.length; i++) {
+                thunks.add(insertPos + i, extraThunks[i]);
+            }
+            resizeInitialInvocationCount();
         }
 
         @Platforms(Platform.HOSTED_ONLY.class)
         public synchronized void addAfter(DiagnosticThunk thunk, Class<? extends DiagnosticThunk> before) {
             int insertPos = indexOf(before) + 1;
+            assert insertPos > 0;
+            thunks.add(insertPos, thunk);
+            resizeInitialInvocationCount();
+        }
 
-            DiagnosticThunk[] newThunks = new DiagnosticThunk[diagnosticThunks.length + 1];
-            System.arraycopy(diagnosticThunks, 0, newThunks, 0, insertPos);
-            newThunks[insertPos] = thunk;
-            System.arraycopy(diagnosticThunks, insertPos, newThunks, insertPos + 1, diagnosticThunks.length - insertPos);
-            diagnosticThunks = newThunks;
-
-            initialInvocationCount = Arrays.copyOf(initialInvocationCount, initialInvocationCount.length + 1);
-            initialInvocationCount[initialInvocationCount.length - 1] = 1;
+        @Platforms(Platform.HOSTED_ONLY.class)
+        private void resizeInitialInvocationCount() {
+            initialInvocationCount = new int[thunks.size()];
+            Arrays.fill(initialInvocationCount, 1);
         }
 
         @Platforms(Platform.HOSTED_ONLY.class)
         private int indexOf(Class<? extends DiagnosticThunk> clazz) {
-            for (int i = 0; i < diagnosticThunks.length; i++) {
-                if (diagnosticThunks[i].getClass() == clazz) {
+            for (int i = 0; i < thunks.size(); i++) {
+                if (thunks.get(i).getClass() == clazz) {
                     return i;
                 }
             }
@@ -1316,11 +1334,11 @@ public class SubstrateDiagnostics {
 
         @Fold
         int size() {
-            return diagnosticThunks.length;
+            return thunks.size();
         }
 
         DiagnosticThunk getThunk(int index) {
-            return diagnosticThunks[index];
+            return thunks.get(index);
         }
 
         int getInitialInvocationCount(int index) {
@@ -1332,14 +1350,80 @@ public class SubstrateDiagnostics {
         }
     }
 
+    @AutomaticallyRegisteredImageSingleton
     public static class Options {
         @Option(help = "Execute an endless loop before printing diagnostics for a fatal error.", type = OptionType.Debug)//
         public static final RuntimeOptionKey<Boolean> LoopOnFatalError = new RuntimeOptionKey<>(false, RelevantForCompilationIsolates) {
             @Override
             protected void onValueUpdate(EconomicMap<OptionKey<?>, Object> values, Boolean oldValue, Boolean newValue) {
                 super.onValueUpdate(values, oldValue, newValue);
-                SubstrateDiagnostics.loopOnFatalError = newValue;
+
+                /*
+                 * Copy the value to a field in the image heap so that it is safe to access. During
+                 * image build, it can happen that the singleton does not exist yet. In that case,
+                 * the value will be copied to the image heap when executing the constructor of the
+                 * singleton. This is a bit cumbersome but necessary because we can't use a static
+                 * field. We also need to mark the option as used at run-time (see feature) as the
+                 * static analysis would otherwise remove the option from the image.
+                 */
+                if (ImageSingletons.contains(Options.class)) {
+                    Options.singleton().loopOnFatalError = newValue;
+                }
             }
         };
+
+        @Option(help = "Determines if implicit exceptions are fatal if they don't have a stack trace.", type = OptionType.Debug)//
+        public static final RuntimeOptionKey<Boolean> ImplicitExceptionWithoutStacktraceIsFatal = new RuntimeOptionKey<>(false, RelevantForCompilationIsolates) {
+            @Override
+            protected void onValueUpdate(EconomicMap<OptionKey<?>, Object> values, Boolean oldValue, Boolean newValue) {
+                super.onValueUpdate(values, oldValue, newValue);
+
+                /* See comment above. */
+                if (ImageSingletons.contains(Options.class)) {
+                    Options.singleton().implicitExceptionWithoutStacktraceIsFatal = newValue;
+                }
+            }
+        };
+
+        private volatile boolean loopOnFatalError;
+        private boolean implicitExceptionWithoutStacktraceIsFatal;
+
+        @Platforms(Platform.HOSTED_ONLY.class)
+        public Options() {
+            this.loopOnFatalError = Options.LoopOnFatalError.getValue();
+            this.implicitExceptionWithoutStacktraceIsFatal = Options.ImplicitExceptionWithoutStacktraceIsFatal.getValue();
+        }
+
+        @Fold
+        static Options singleton() {
+            return ImageSingletons.lookup(Options.class);
+        }
+
+        public static boolean shouldLoopOnFatalError() {
+            return singleton().loopOnFatalError;
+        }
+
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        public static boolean implicitExceptionWithoutStacktraceIsFatal() {
+            return singleton().implicitExceptionWithoutStacktraceIsFatal;
+        }
+    }
+}
+
+@AutomaticallyRegisteredFeature
+class SubstrateDiagnosticsFeature implements InternalFeature {
+    /**
+     * {@link RuntimeCompilation#isEnabled()} can't be executed in the
+     * {@link DiagnosticThunkRegistry} constructor because the feature registration is not
+     * necessarily finished. So, we need to do it at a later point in time.
+     */
+    @Override
+    public void afterRegistration(AfterRegistrationAccess access) {
+        DiagnosticThunkRegistry registry = DiagnosticThunkRegistry.singleton();
+        if (RuntimeCompilation.isEnabled()) {
+            int pos = registry.runtimeCompilationPosition;
+            SubstrateDiagnostics.DiagnosticThunk[] thunks = {new DumpCodeCacheHistory(), new DumpRuntimeCodeInfoMemory(), new DumpDeoptStubPointer(), new DumpRecentDeoptimizations()};
+            registry.add(pos, thunks);
+        }
     }
 }

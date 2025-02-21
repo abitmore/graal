@@ -24,6 +24,8 @@
  */
 package com.oracle.svm.core.meta;
 
+import org.graalvm.word.WordBase;
+
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.util.VMError;
 
@@ -44,6 +46,14 @@ public interface SharedType extends ResolvedJavaType {
      * the field on the Java type system level).
      */
     JavaKind getStorageKind();
+
+    int getTypeID();
+
+    /**
+     * Returns true if this type is part of the word type hierarchy, i.e, implements
+     * {@link WordBase}.
+     */
+    boolean isWordType();
 
     @Override
     default ResolvedJavaMethod resolveMethod(ResolvedJavaMethod method, ResolvedJavaType callerType) {

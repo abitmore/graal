@@ -35,10 +35,15 @@ public class DerivedConvertedInductionVariable extends DerivedInductionVariable 
     protected final Stamp stamp;
     protected final ValueNode value;
 
-    public DerivedConvertedInductionVariable(LoopEx loop, InductionVariable base, Stamp stamp, ValueNode value) {
+    public DerivedConvertedInductionVariable(Loop loop, InductionVariable base, Stamp stamp, ValueNode value) {
         super(loop, base);
         this.stamp = stamp;
         this.value = value;
+    }
+
+    @Override
+    public boolean structuralIntegrityValid() {
+        return super.structuralIntegrityValid() && value.isAlive();
     }
 
     @Override
@@ -82,6 +87,16 @@ public class DerivedConvertedInductionVariable extends DerivedInductionVariable 
     }
 
     @Override
+    public boolean isConstantExtremum() {
+        return base.isConstantExtremum();
+    }
+
+    @Override
+    public long constantExtremum() {
+        return base.constantExtremum();
+    }
+
+    @Override
     public ValueNode extremumNode(boolean assumeLoopEntered, Stamp s) {
         // base.extremumNode will already perform any necessary conversion operation based on the
         // stamp, thus we do not "redo" the same here, the caller decides upon the request result
@@ -100,16 +115,6 @@ public class DerivedConvertedInductionVariable extends DerivedInductionVariable 
     @Override
     public ValueNode exitValueNode() {
         return op(base.exitValueNode(), true);
-    }
-
-    @Override
-    public boolean isConstantExtremum() {
-        return base.isConstantExtremum();
-    }
-
-    @Override
-    public long constantExtremum() {
-        return base.constantExtremum();
     }
 
     @Override

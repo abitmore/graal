@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,8 +31,6 @@ import static jdk.graal.compiler.asm.aarch64.AArch64Assembler.Instruction.LDP;
 import static jdk.graal.compiler.asm.aarch64.AArch64Assembler.Instruction.STP;
 import static jdk.vm.ci.aarch64.AArch64.CPU;
 import static jdk.vm.ci.aarch64.AArch64.SIMD;
-import static jdk.vm.ci.aarch64.AArch64.rscratch1;
-import static jdk.vm.ci.aarch64.AArch64.rscratch2;
 import static jdk.vm.ci.aarch64.AArch64.sp;
 import static jdk.vm.ci.aarch64.AArch64.zr;
 
@@ -48,9 +46,7 @@ import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.code.Register;
 import jdk.vm.ci.code.TargetDescription;
 
-public class AArch64MacroAssembler extends AArch64Assembler {
-
-    private final ScratchRegister[] scratchRegister = new ScratchRegister[]{new ScratchRegister(rscratch1), new ScratchRegister(rscratch2)};
+public abstract class AArch64MacroAssembler extends AArch64Assembler {
 
     // Points to the next free scratch register
     private int nextFreeScratchRegister = 0;
@@ -73,6 +69,8 @@ public class AArch64MacroAssembler extends AArch64Assembler {
         this.neon = new AArch64ASIMDMacroAssembler(this);
     }
 
+    protected abstract ScratchRegister[] getScratchRegisters();
+
     public class ScratchRegister implements AutoCloseable {
         private final Register register;
 
@@ -92,7 +90,10 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     public ScratchRegister getScratchRegister() {
-        return scratchRegister[nextFreeScratchRegister++];
+        if (nextFreeScratchRegister == getScratchRegisters().length) {
+            throw new GraalError("Out of scratch registers: " + nextFreeScratchRegister);
+        }
+        return getScratchRegisters()[nextFreeScratchRegister++];
     }
 
     @Override
@@ -339,7 +340,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
             curOffset = curOffset * byteMemoryTransferSize;
         }
         int preOffset = lastImmLoadStoreEncoding.getOffset();
-        if (Math.abs(curOffset - preOffset) != byteMemoryTransferSize) {
+        if (NumUtil.safeAbs(curOffset - preOffset) != byteMemoryTransferSize) {
             return false;
         }
 
@@ -355,7 +356,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
         }
 
         // Alignment checking.
-        if (isFlagSet(AArch64.Flag.AvoidUnalignedAccesses)) {
+        if (avoidUnalignedAccesses()) {
             // AArch64 sp is 16-bytes aligned.
             if (curBase.equals(sp)) {
                 long pairMask = byteMemoryTransferSize * 2 - 1;
@@ -476,6 +477,13 @@ public class AArch64MacroAssembler extends AArch64Assembler {
         if (needsImmAnnotation) {
             annotateImmediateMovSequence(pos, includeSet);
         }
+    }
+
+    /**
+     * A fixed format movz to produce a uimm16.
+     */
+    public void movzPatchable(int size, Register dst, int uimm16) {
+        movz(size, dst, uimm16, 0);
     }
 
     /**
@@ -1003,7 +1011,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * dst = src1 + shiftType(src2, shiftAmt & (size - 1)).
+     * dst = src1 + shiftType(src2, shiftAmt &amp; (size - 1)).
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null or stackpointer.
@@ -1024,7 +1032,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * dst = src1 - shiftType(src2, shiftAmt & (size-1)) and sets condition flags.
+     * dst = src1 - shiftType(src2, shiftAmt &amp; (size-1)) and sets condition flags.
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null or stackpointer.
@@ -1056,7 +1064,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * dst = -(shiftType(src, shiftAmt & (size - 1))).
+     * dst = -(shiftType(src, shiftAmt &amp; (size - 1))).
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null or stackpointer.
@@ -1081,7 +1089,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
      */
     public void add(int size, Register dst, Register src, int immediate, Register scratch) {
         assert (!dst.equals(zr) && !src.equals(zr)) : dst + " " + src;
-        if (immediate < 0) {
+        if (-immediate > 0) {
             sub(size, dst, src, -immediate, scratch);
         } else if (NumUtil.isUnsignedNbit(24, immediate) || !dst.equals(src)) {
             add(size, dst, src, immediate);
@@ -1106,7 +1114,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     @Override
     public void add(int size, Register dst, Register src, int immediate) {
         assert (!dst.equals(zr) && !src.equals(zr)) : dst + " " + src;
-        if (immediate < 0) {
+        if (-immediate > 0) {
             sub(size, dst, src, -immediate);
         } else if (isAddSubtractImmediate(immediate, false)) {
             if (!(dst.equals(src) && immediate == 0)) {
@@ -1153,7 +1161,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     @Override
     public void adds(int size, Register dst, Register src, int immediate) {
         assert (!dst.equals(sp) && !src.equals(zr)) : dst + " " + src;
-        if (immediate < 0) {
+        if (-immediate > 0) {
             subs(size, dst, src, -immediate);
         } else {
             super.adds(size, dst, src, immediate);
@@ -1173,7 +1181,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
      */
     public void sub(int size, Register dst, Register src, int immediate, Register scratch) {
         assert (!dst.equals(zr) && !src.equals(zr)) : dst + " " + src;
-        if (immediate < 0) {
+        if (-immediate > 0) {
             add(size, dst, src, -immediate, scratch);
         }
         if (NumUtil.isUnsignedNbit(24, immediate) || !dst.equals(src)) {
@@ -1199,7 +1207,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     @Override
     public void sub(int size, Register dst, Register src, int immediate) {
         assert (!dst.equals(zr) && !src.equals(zr)) : dst + " " + src;
-        if (immediate < 0) {
+        if (-immediate > 0) {
             add(size, dst, src, -immediate);
         } else if (isAddSubtractImmediate(immediate, false)) {
             if (!(dst.equals(src) && immediate == 0)) {
@@ -1226,7 +1234,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     @Override
     public void subs(int size, Register dst, Register src, int immediate) {
         assert (!dst.equals(sp) && !src.equals(zr)) : dst + " " + src;
-        if (immediate < 0) {
+        if (-immediate > 0) {
             adds(size, dst, src, -immediate);
         } else {
             super.subs(size, dst, src, immediate);
@@ -1335,7 +1343,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     /**
      * C.6.2.179 Logical Shift Left (immediate).
      * <p>
-     * dst = src << (shiftAmt & (size - 1)).
+     * dst = src &lt;&lt; (shiftAmt &amp; (size - 1)).
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null, stackpointer or zero-register.
@@ -1354,7 +1362,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     /**
      * C.6.2.182 Logical Shift Right (immediate).
      * <p>
-     * dst = src >>> (shiftAmt & (size - 1)).
+     * dst = src >>> (shiftAmt &amp; (size - 1)).
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null, stackpointer or zero-register.
@@ -1369,7 +1377,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * dst = src >> (shiftAmt & log2(size)).
+     * dst = src >> (shiftAmt &amp; log2(size)).
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null, stackpointer or zero-register.
@@ -1384,7 +1392,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * C.6.2.228 Rotate right (register). dst = rotateRight(src1, (src2 & (size - 1))).<br>
+     * C.6.2.228 Rotate right (register). dst = rotateRight(src1, (src2 &amp; (size - 1))).<br>
      *
      * Preferred alias for RORV (C6.2.228)
      *
@@ -1415,7 +1423,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * Clamps shiftAmt into range 0 <= shiftamt < size according to JLS.
+     * Clamps shiftAmt into range 0 &lt;= shiftamt &lt; size according to JLS.
      *
      * @param size size of operation. Must be 32 or 64.
      * @param shiftAmt arbitrary shift amount.
@@ -1441,7 +1449,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * dst = src1 & src2.
+     * dst = src1 &amp; src2.
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null or stackpointer.
@@ -1477,7 +1485,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * dst = src1 & (~src2).
+     * dst = src1 &amp; (~src2).
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null or stackpointer.
@@ -1489,7 +1497,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * dst = src & (~imm).
+     * dst = src &amp; (~imm).
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null or stackpointer.
@@ -1645,7 +1653,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
      */
     public void compare(int size, Register x, int y) {
         assert size == 32 || size == 64 : size;
-        assert isComparisonImmediate(y);
+        GraalError.guarantee(isComparisonImmediate(y), "invalid immediate value %s", y);
         /*
          * AArch64 has two compare instructions supporting an immediate operand: compare (cmp) and
          * compare negative (cmn), which are aliases for SUBS and ADDS, respectively. In both
@@ -1662,7 +1670,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * Compares x to (extendType(y) << imm) and sets condition flags.
+     * Compares x to (extendType(y) &lt;&tl; imm) and sets condition flags.
      *
      * This is an alias for {@link #subs(int, Register, Register, Register, ExtendType, int)}.
      *
@@ -1678,7 +1686,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     }
 
     /**
-     * Sets condition flags according to result of x & y.
+     * Sets condition flags according to result of x &amp; y.
      *
      * @param size register size. Has to be 32 or 64.
      * @param dst general purpose register. May not be null or stack-pointer.
@@ -1692,7 +1700,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     /**
      * C6.2.334 Test bits (immediate).<br>
      *
-     * Sets condition flags according to the result of x & bimm
+     * Sets condition flags according to the result of x &amp; bimm
      */
     public void tst(int size, Register x, long bimm) {
         ands(size, zr, x, bimm);
@@ -1701,7 +1709,7 @@ public class AArch64MacroAssembler extends AArch64Assembler {
     /**
      * C6.2.335 Test bits (register).<br>
      *
-     * Sets condition flags according to the result of x & y
+     * Sets condition flags according to the result of x &amp; y
      */
     public void tst(int size, Register x, Register y) {
         ands(size, zr, x, y);
@@ -1985,12 +1993,17 @@ public class AArch64MacroAssembler extends AArch64Assembler {
      */
     @Override
     public void align(int modulus) {
+        align(modulus, position());
+    }
+
+    /**
+     * Ensure that the code at {@code target} bytes offset from the current {@link #position()} is
+     * aligned according to {@code modulus}.
+     */
+    public void align(int modulus, int target) {
         assert modulus > 0 && (modulus & 0b11) == 0 : "Modulus has to be a positive multiple of 4.";
-        if (position() % modulus == 0) {
-            return;
-        }
-        int offset = modulus - position() % modulus;
-        for (int i = 0; i < offset; i += 4) {
+        int delta = target - position();
+        while ((position() + delta) % modulus != 0) {
             nop();
         }
     }
@@ -2242,5 +2255,13 @@ public class AArch64MacroAssembler extends AArch64Assembler {
                 siteOffset += 4;
             }
         }
+    }
+
+    public boolean useLSE() {
+        return getFeatures().contains(AArch64.CPUFeature.LSE);
+    }
+
+    public boolean avoidUnalignedAccesses() {
+        return false;
     }
 }

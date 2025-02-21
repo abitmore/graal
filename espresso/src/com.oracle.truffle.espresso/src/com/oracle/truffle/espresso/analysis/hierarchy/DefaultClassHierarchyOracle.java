@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -20,10 +20,9 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.analysis.hierarchy;
 
-import com.oracle.truffle.espresso.descriptors.Symbol;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Types;
 import com.oracle.truffle.espresso.impl.Method;
 import com.oracle.truffle.espresso.impl.ObjectKlass;
 
@@ -148,10 +147,10 @@ public final class DefaultClassHierarchyOracle implements ClassHierarchyOracle {
         for (int methodIndex = 0; methodIndex < itable.length; methodIndex++) {
             Method.MethodVersion m = itable[methodIndex];
             // This class' itable entry for this method is not the interface's declared method.
-            if (m.getDeclaringKlassRef() != currInterface) {
+            if (m.getMethod().getDeclaringKlass() != currInterface) {
                 Method.MethodVersion intfMethod = currInterface.getInterfaceMethodsTable()[methodIndex];
                 // sanity checks
-                assert intfMethod.getDeclaringKlassRef() == currInterface;
+                assert intfMethod.getMethod().getDeclaringKlass() == currInterface;
                 assert m.getMethod().canOverride(intfMethod.getMethod()) && m.getName() == intfMethod.getName() && m.getRawSignature() == intfMethod.getRawSignature();
                 isLeafMethod(intfMethod).invalidate();
             }
@@ -161,7 +160,7 @@ public final class DefaultClassHierarchyOracle implements ClassHierarchyOracle {
     @Override
     public SingleImplementor initializeImplementorForNewKlass(ObjectKlass klass) {
         // java.io.Serializable and java.lang.Cloneable are always implemented by all arrays
-        if (klass.getType() == Symbol.Type.java_io_Serializable || klass.getType() == Symbol.Type.java_lang_Cloneable) {
+        if (klass.getType() == Types.java_io_Serializable || klass.getType() == Types.java_lang_Cloneable) {
             return SingleImplementor.MultipleImplementors;
         }
         if (klass.isAbstract() || klass.isInterface()) {

@@ -56,9 +56,6 @@ abstract class Generation {
     /** Print some heap statistics to a log. */
     public abstract void logUsage(Log log);
 
-    /** Print some information about the chunks to the log. */
-    public abstract void logChunks(Log log);
-
     /**
      * Promote an Object to this Generation, typically by copying and leaving a forwarding pointer
      * to the new Object in place of the original Object. If the object cannot be promoted due to
@@ -99,5 +96,11 @@ abstract class Generation {
      *
      * @return true on success, false if the there was insufficient capacity.
      */
-    protected abstract boolean promoteChunk(HeapChunk.Header<?> originalChunk, boolean isAligned, Space originalSpace);
+    protected abstract boolean promotePinnedObject(Object obj, HeapChunk.Header<?> originalChunk, boolean isAligned, Space originalSpace);
+
+    void checkSanityBeforeCollection() {
+    }
+
+    void checkSanityAfterCollection() {
+    }
 }

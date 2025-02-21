@@ -28,7 +28,7 @@ import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
 
-import jdk.vm.ci.common.NativeImageReinitialize;
+import jdk.graal.compiler.util.SignatureUtil;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.MetaAccessProvider;
@@ -44,11 +44,11 @@ import jdk.vm.ci.meta.UnresolvedJavaType;
  */
 public final class SnippetSignature implements Signature {
 
-    private final List<String> parameters = new ArrayList<>();
+    private final List<String> parameters;
     private final String returnType;
     private final String originalString;
 
-    @NativeImageReinitialize private static EnumMap<JavaKind, ResolvedJavaType> primitiveTypes = null;
+    private static EnumMap<JavaKind, ResolvedJavaType> primitiveTypes = null;
 
     static synchronized void initPrimitiveKindCache(MetaAccessProvider metaAccess) {
         if (primitiveTypes == null) {
@@ -65,66 +65,10 @@ public final class SnippetSignature implements Signature {
     }
 
     public SnippetSignature(String signature) {
-        if (signature.length() == 0) {
-            throw new IllegalArgumentException("Signature cannot be empty");
-        }
-        this.originalString = signature;
-
-        if (signature.charAt(0) == '(') {
-            int cur = 1;
-            while (cur < signature.length() && signature.charAt(cur) != ')') {
-                int nextCur = parseSignature(signature, cur);
-                parameters.add(signature.substring(cur, nextCur));
-                cur = nextCur;
-            }
-
-            cur++;
-            int nextCur = parseSignature(signature, cur);
-            returnType = signature.substring(cur, nextCur);
-            if (nextCur != signature.length()) {
-                throw new IllegalArgumentException("Extra characters at end of signature: " + signature);
-            }
-        } else {
-            throw new IllegalArgumentException("Signature must start with a '(': " + signature);
-        }
-    }
-
-    private static int parseSignature(String signature, int start) {
-        try {
-            int cur = start;
-            char first;
-            do {
-                first = signature.charAt(cur);
-                cur++;
-            } while (first == '[');
-
-            switch (first) {
-                case 'L':
-                    while (signature.charAt(cur) != ';') {
-                        if (signature.charAt(cur) == '.') {
-                            throw new IllegalArgumentException("Class name in signature contains '.' at index " + cur + ": " + signature);
-                        }
-                        cur++;
-                    }
-                    cur++;
-                    break;
-                case 'V':
-                case 'I':
-                case 'B':
-                case 'C':
-                case 'D':
-                case 'F':
-                case 'J':
-                case 'S':
-                case 'Z':
-                    break;
-                default:
-                    throw new IllegalArgumentException("Invalid character '" + signature.charAt(cur - 1) + "' at index " + (cur - 1) + " in signature: " + signature);
-            }
-            return cur;
-        } catch (StringIndexOutOfBoundsException e) {
-            throw new IllegalArgumentException("Truncated signature: " + signature);
-        }
+        ArrayList<String> buffer = new ArrayList<>();
+        returnType = SignatureUtil.parseSignature(signature, buffer);
+        parameters = List.copyOf(buffer);
+        originalString = signature;
     }
 
     @Override

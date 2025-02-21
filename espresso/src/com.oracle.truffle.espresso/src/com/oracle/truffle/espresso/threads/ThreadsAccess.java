@@ -20,7 +20,6 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.threads;
 
 import static com.oracle.truffle.espresso.threads.KillStatus.EXITING;
@@ -37,7 +36,6 @@ import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.espresso.blocking.EspressoLock;
 import com.oracle.truffle.espresso.blocking.GuestInterrupter;
 import com.oracle.truffle.espresso.impl.ContextAccessImpl;
-import com.oracle.truffle.espresso.impl.Method;
 import com.oracle.truffle.espresso.meta.EspressoError;
 import com.oracle.truffle.espresso.meta.Meta;
 import com.oracle.truffle.espresso.runtime.EspressoExitException;
@@ -300,9 +298,7 @@ public final class ThreadsAccess extends ContextAccessImpl implements GuestInter
     public void callInterrupt(StaticObject guestThread) {
         assert guestThread != null && getMeta().java_lang_Thread.isAssignableFrom(guestThread.getKlass());
         // Thread.interrupt is non-final.
-        Method interruptMethod = guestThread.getKlass().vtableLookup(getMeta().java_lang_Thread_interrupt.getVTableIndex());
-        assert interruptMethod != null;
-        interruptMethod.invokeDirect(guestThread);
+        getMeta().java_lang_Thread_interrupt.invokeDirectVirtual(guestThread);
     }
 
     /**
@@ -457,7 +453,7 @@ public final class ThreadsAccess extends ContextAccessImpl implements GuestInter
             if (!getContext().isTruffleClosed()) {
                 try {
                     if (exit == null) {
-                        meta.java_lang_Thread_exit.invokeDirect(thread);
+                        meta.java_lang_Thread_exit.invokeDirectSpecial(thread);
                     } else {
                         exit.call(thread);
                     }
