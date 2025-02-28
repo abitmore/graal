@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,7 +24,7 @@
  */
 package jdk.graal.compiler.lir.aarch64;
 
-import static jdk.vm.ci.aarch64.AArch64.r10;
+import static jdk.vm.ci.aarch64.AArch64.r11;
 import static jdk.vm.ci.aarch64.AArch64.r3;
 import static jdk.vm.ci.aarch64.AArch64.r4;
 import static jdk.vm.ci.aarch64.AArch64.r5;
@@ -69,10 +69,10 @@ import jdk.vm.ci.meta.Value;
  * Returns the number of positive bytes.
  */
 // @formatter:off
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/0a3a925ad88921d387aa851157f54ac0054d347b/src/hotspot/cpu/aarch64/macroAssembler_aarch64.cpp#L5045-L5114",
+@SyncPort(from = "https://github.com/openjdk/jdk/blob/98a93e115137a305aed6b7dbf1d4a7d5906fe77c/src/hotspot/cpu/aarch64/macroAssembler_aarch64.cpp#L5749-L5818",
           sha1 = "ce54a7cf2fcfe7ccb8f6604c038887fc1c4ebce1")
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/0a3a925ad88921d387aa851157f54ac0054d347b/src/hotspot/cpu/aarch64/stubGenerator_aarch64.cpp#L4955-L5121",
-          sha1 = "3b4e6edb4372e8babb009763c2d05961348dd723")
+@SyncPort(from = "https://github.com/openjdk/jdk/blob/642816538fbaa5b74c6beb8a14d1738cdde28c10/src/hotspot/cpu/aarch64/stubGenerator_aarch64.cpp#L5139-L5306",
+          sha1 = "45239b79c957ea992a4d05afa358d5b953fe84fe")
 // @formatter:on
 @Opcode("AARCH64_COUNT_POSITIVES")
 public final class AArch64CountPositivesOp extends AArch64ComplexVectorOp {
@@ -108,8 +108,8 @@ public final class AArch64CountPositivesOp extends AArch64ComplexVectorOp {
                         r5.asValue(),
                         r6.asValue(),
                         r7.asValue(),
-                        // r8 and r9 are scratch registers
-                        r10.asValue(),
+                        // r8 and r9 are scratch registers on HotSpot, r9/r10 on SubstrateVM
+                        r11.asValue(),
                         v0.asValue(),
                         v1.asValue(),
                         v2.asValue(),
@@ -217,7 +217,7 @@ public final class AArch64CountPositivesOp extends AArch64ComplexVectorOp {
         Register tmp3 = r5;
         Register tmp4 = r6;
         Register tmp5 = r7;
-        Register tmp6 = r10;
+        Register tmp6 = r11;
 
         Register vtmp0 = v0;
         Register vtmp1 = v1;
@@ -323,9 +323,8 @@ public final class AArch64CountPositivesOp extends AArch64ComplexVectorOp {
         // right-shift by 7 to get only the sign bits
         masm.neon.ushrVVI(FullReg, ElementSize.Byte, vtmp0, vtmp0, 7);
         // check if result is zero
-        masm.fcmpZero(64, vtmp0);
+        cbnzVector(masm, ElementSize.Byte, vtmp0, vtmp0, tmp5, false, labelRetAdjustLong);
 
-        masm.branchConditionally(ConditionFlag.NE, labelRetAdjustLong);
         masm.compare(32, len, LARGE_LOOP_SIZE);
         masm.branchConditionally(ConditionFlag.GE, labelLargeLoop);
 

@@ -27,12 +27,14 @@ package com.oracle.svm.core.genscavenge;
 import static com.oracle.svm.core.genscavenge.CollectionPolicy.shouldCollectYoungGenSeparately;
 
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
 import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.heap.GCCause;
+import com.oracle.svm.core.util.BasedOnJDKFile;
 import com.oracle.svm.core.util.TimeUtils;
 import com.oracle.svm.core.util.UnsignedUtils;
+
+import jdk.graal.compiler.word.Word;
 
 /**
  * A garbage collection policy that balances throughput and memory footprint.
@@ -42,6 +44,13 @@ import com.oracle.svm.core.util.UnsignedUtils;
  * its base class {@code AdaptiveSizePolicy}. Method and variable names have been kept mostly the
  * same for comparability.
  */
+@BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-25+2/src/hotspot/share/gc/shared/adaptiveSizePolicy.hpp")
+@BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-25+7/src/hotspot/share/gc/shared/adaptiveSizePolicy.cpp")
+@BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-25+1/src/hotspot/share/gc/parallel/psAdaptiveSizePolicy.hpp")
+@BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-25+7/src/hotspot/share/gc/parallel/psAdaptiveSizePolicy.cpp")
+@BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-25+6/src/hotspot/share/gc/parallel/psParallelCompact.cpp#L959-L1180")
+@BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-25+6/src/hotspot/share/gc/parallel/psScavenge.cpp#L321-L637")
+@BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-25+1/src/hotspot/share/gc/shared/gc_globals.hpp#L308-L420")
 class AdaptiveCollectionPolicy extends AbstractCollectionPolicy {
 
     /*
@@ -126,7 +135,7 @@ class AdaptiveCollectionPolicy extends AbstractCollectionPolicy {
     private long minorCount;
     private long latestMinorMutatorIntervalNanos;
     private boolean youngGenPolicyIsReady;
-    private UnsignedWord youngGenSizeIncrementSupplement = WordFactory.unsigned(YOUNG_GENERATION_SIZE_SUPPLEMENT);
+    private UnsignedWord youngGenSizeIncrementSupplement = Word.unsigned(YOUNG_GENERATION_SIZE_SUPPLEMENT);
     private long youngGenChangeForMinorThroughput;
     private int minorCountSinceMajorCollection;
 
@@ -137,7 +146,7 @@ class AdaptiveCollectionPolicy extends AbstractCollectionPolicy {
     private final AdaptiveWeightedAverage avgOldLive = new AdaptiveWeightedAverage(ADAPTIVE_SIZE_POLICY_WEIGHT);
     private final ReciprocalLeastSquareFit majorCostEstimator = new ReciprocalLeastSquareFit(ADAPTIVE_SIZE_COST_ESTIMATORS_HISTORY_LENGTH);
     private long majorCount;
-    private UnsignedWord oldGenSizeIncrementSupplement = WordFactory.unsigned(TENURED_GENERATION_SIZE_SUPPLEMENT);
+    private UnsignedWord oldGenSizeIncrementSupplement = Word.unsigned(TENURED_GENERATION_SIZE_SUPPLEMENT);
     private long latestMajorMutatorIntervalNanos;
     private boolean oldSizeExceededInPreviousCollection;
     private long oldGenChangeForMajorThroughput;
@@ -152,14 +161,16 @@ class AdaptiveCollectionPolicy extends AbstractCollectionPolicy {
     }
 
     @Override
-    public boolean shouldCollectCompletely(boolean followingIncrementalCollection) { // should_{attempt_scavenge,full_GC}
+    public boolean shouldCollectCompletely(boolean followingIncrementalCollection) { // should_attempt_scavenge
         guaranteeSizeParametersInitialized();
 
-        if (!followingIncrementalCollection && shouldCollectYoungGenSeparately(true)) {
+        boolean collectYoungSeparately = shouldCollectYoungGenSeparately(!SerialGCOptions.useCompactingOldGen());
+        if (!followingIncrementalCollection && collectYoungSeparately) {
             /*
-             * Default to always doing an incremental collection first because we expect most of the
-             * objects in the young generation to be garbage, and we can reuse their leftover chunks
-             * for copying the live objects in the old generation with fewer allocations.
+             * With a copying collector, default to always doing an incremental collection first
+             * because we expect most of the objects in the young generation to be garbage, and we
+             * can reuse their leftover chunks for copying the live objects in the old generation
+             * with fewer allocations. With a compacting collector, there is no benefit.
              */
             return false;
         }
@@ -172,6 +183,12 @@ class AdaptiveCollectionPolicy extends AbstractCollectionPolicy {
              */
             return true;
         }
+
+        if (!collectYoungSeparately && followingIncrementalCollection) {
+            // Don't override the earlier decision to not do a full GC below (and prolong the pause)
+            return false;
+        }
+
         if (minorCountSinceMajorCollection * avgMinorPause.getAverage() >= CONSECUTIVE_MINOR_TO_MAJOR_COLLECTION_PAUSE_TIME_RATIO * avgMajorPause.getPaddedAverage()) {
             /*
              * When we do many incremental collections in a row because they reclaim sufficient
@@ -324,7 +341,7 @@ class AdaptiveCollectionPolicy extends AbstractCollectionPolicy {
     }
 
     private static UnsignedWord edenDecrement(UnsignedWord curEden) {
-        return spaceIncrement(curEden, WordFactory.unsigned(YOUNG_GENERATION_SIZE_INCREMENT))
+        return spaceIncrement(curEden, Word.unsigned(YOUNG_GENERATION_SIZE_INCREMENT))
                         .unsignedDivide(ADAPTIVE_SIZE_DECREMENT_SCALE_FACTOR);
     }
 
@@ -513,7 +530,7 @@ class AdaptiveCollectionPolicy extends AbstractCollectionPolicy {
     }
 
     private static UnsignedWord promoIncrement(UnsignedWord curPromo) {
-        return spaceIncrement(curPromo, WordFactory.unsigned(TENURED_GENERATION_SIZE_INCREMENT));
+        return spaceIncrement(curPromo, Word.unsigned(TENURED_GENERATION_SIZE_INCREMENT));
     }
 
     private UnsignedWord promoIncrementWithSupplementAlignedUp(UnsignedWord curPromo) {

@@ -188,15 +188,14 @@ public class OptionValues {
     }
 
     /**
-     * Prints a help message to {@code out} describing all options available via {@code loader}. The
+     * Prints a help message to {@code out} describing the options available via {@code loader}. The
      * key/value for each option is separated by {@code :=} if the option has an entry in this
      * object otherwise {@code =} is used as the separator.
      *
-     * @param loader
-     * @param out
-     * @param namePrefix
+     * @param all if true, all options are printed otherwise only {@linkplain #excludeOptionFromHelp
+     *            non-excluded} options are printed.
      */
-    public void printHelp(Iterable<OptionDescriptors> loader, PrintStream out, String namePrefix) {
+    public void printHelp(Iterable<OptionDescriptors> loader, PrintStream out, String namePrefix, boolean all) {
         SortedMap<String, OptionDescriptor> sortedOptions = new TreeMap<>();
         for (OptionDescriptors opts : loader) {
             for (OptionDescriptor desc : opts) {
@@ -206,34 +205,65 @@ public class OptionValues {
             }
         }
         for (Map.Entry<String, OptionDescriptor> e : sortedOptions.entrySet()) {
+            String key = e.getKey();
             OptionDescriptor desc = e.getValue();
-            Object value = desc.getOptionKey().getValue(this);
-            if (value instanceof String) {
-                value = '"' + String.valueOf(value) + '"';
-            }
-            String name = namePrefix + e.getKey();
-            String assign = containsKey(desc.getOptionKey()) ? ":=" : "=";
-            String typeName = desc.getOptionKey() instanceof EnumOptionKey ? "String" : desc.getOptionValueType().getSimpleName();
-            String linePrefix = String.format("%s %s %s ", name, assign, value);
-            int typeStartPos = PROPERTY_LINE_WIDTH - typeName.length();
-            int linePad = typeStartPos - linePrefix.length();
-            if (linePad > 0) {
-                out.printf("%s%-" + linePad + "s[%s]%n", linePrefix, "", typeName);
-            } else {
-                out.printf("%s[%s]%n", linePrefix, typeName);
-            }
-
-            List<String> helpLines;
-            String help = desc.getHelp();
-            if (help.length() != 0) {
-                helpLines = wrap(help, PROPERTY_LINE_WIDTH - PROPERTY_HELP_INDENT);
-                helpLines.addAll(desc.getExtraHelp());
-            } else {
-                helpLines = desc.getExtraHelp();
-            }
-            for (String line : helpLines) {
-                out.printf("%" + PROPERTY_HELP_INDENT + "s%s%n", "", line);
+            if (all || !excludeOptionFromHelp(desc)) {
+                String edition = String.format("[%s edition]", OptionsParser.isEnterpriseOption(desc) ? "enterprise" : "community");
+                printHelp(out, namePrefix,
+                                key,
+                                desc.getOptionKey().getValue(this),
+                                desc.getOptionValueType(),
+                                containsKey(desc.getOptionKey()) ? ":=" : "=",
+                                edition,
+                                desc.getHelp(),
+                                desc.getExtraHelp());
             }
         }
+    }
+
+    private static Object quoteNonNullString(Class<?> valueType, Object value) {
+        if (valueType == String.class && value != null) {
+            return '"' + String.valueOf(value) + '"';
+        }
+        return value;
+    }
+
+    public static void printHelp(PrintStream out, String namePrefix,
+                    String key,
+                    Object value,
+                    Class<?> valueType,
+                    String assign,
+                    String edition,
+                    String help,
+                    List<String> extraHelp) {
+        String name = namePrefix + key;
+        String linePrefix = String.format("%s %s %s %s", name, assign, quoteNonNullString(valueType, value), edition);
+
+        String typeName = valueType.isEnum() ? "String" : valueType.getSimpleName();
+        int typeStartPos = PROPERTY_LINE_WIDTH - typeName.length();
+        int linePad = typeStartPos - linePrefix.length();
+        if (linePad > 0) {
+            out.printf("%s%-" + linePad + "s[%s]%n", linePrefix, "", typeName);
+        } else {
+            out.printf("%s[%s]%n", linePrefix, typeName);
+        }
+
+        List<String> helpLines;
+        if (!help.isEmpty()) {
+            helpLines = wrap(help, PROPERTY_LINE_WIDTH - PROPERTY_HELP_INDENT);
+            helpLines.addAll(extraHelp);
+        } else {
+            helpLines = extraHelp;
+        }
+        for (String line : helpLines) {
+            out.printf("%" + PROPERTY_HELP_INDENT + "s%s%n", "", line);
+        }
+        // print new line after each option
+        out.printf("%n");
+    }
+
+    private static boolean excludeOptionFromHelp(OptionDescriptor desc) {
+        /* Filter out debug options. */
+        return desc.getOptionType() == OptionType.Debug;
     }
 }

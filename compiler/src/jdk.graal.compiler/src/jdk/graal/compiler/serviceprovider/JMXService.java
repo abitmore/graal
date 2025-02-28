@@ -31,6 +31,7 @@ import java.util.List;
  * this abstraction enables avoiding a dependency to the {@code java.management} and
  * {@code jdk.management} modules.
  */
+@LibGraalService
 public abstract class JMXService {
     protected abstract long getThreadAllocatedBytes(long id);
 
@@ -41,8 +42,4 @@ public abstract class JMXService {
     protected abstract boolean isCurrentThreadCpuTimeSupported();
 
     protected abstract List<String> getInputArguments();
-
-    // Placing this static field in JMXService (instead of GraalServices)
-    // allows for lazy initialization.
-    static final JMXService instance = GraalServices.loadSingle(JMXService.class, false);
 }

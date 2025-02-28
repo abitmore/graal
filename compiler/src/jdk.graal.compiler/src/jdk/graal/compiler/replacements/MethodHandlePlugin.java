@@ -42,7 +42,6 @@ import jdk.graal.compiler.replacements.nodes.MacroInvokable;
 import jdk.graal.compiler.replacements.nodes.MacroNode;
 import jdk.graal.compiler.replacements.nodes.MethodHandleNode;
 import jdk.graal.compiler.replacements.nodes.ResolvedMethodHandleCallTargetNode;
-
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MethodHandleAccessProvider;
 import jdk.vm.ci.meta.MethodHandleAccessProvider.IntrinsicMethod;
@@ -66,10 +65,22 @@ public class MethodHandlePlugin implements NodePlugin {
         return new MethodHandleNode(intrinsicMethod, MacroNode.MacroParams.of(invokeKind, b.getMethod(), method, b.bci(), invokeReturnStamp, args));
     }
 
+    /**
+     * Hook to add custom code on creation of MethodHandleNodes.
+     */
+    @SuppressWarnings("unused")
+    protected void onCreateHook(MacroInvokable methodHandleNode, GraphBuilderContext b) {
+        /* Nothing to do here */
+    }
+
     @Override
     public boolean handleInvoke(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args) {
         IntrinsicMethod intrinsicMethod = methodHandleAccess.lookupMethodHandleIntrinsic(method);
-        if (intrinsicMethod != null) {
+        // We skip intrinsification for LINK_TO_NATIVE, because:
+        // 1. HotSpot generates compiler entry jumping to the native wrapper of the target c method.
+        // 2. SVM intrinsification is not yet implemented.
+        // Use String comparison for JDK21 compatibility.
+        if (intrinsicMethod != null && !"LINK_TO_NATIVE".equals(intrinsicMethod.name())) {
             InvokeKind invokeKind = b.getInvokeKind();
             if (invokeKind != InvokeKind.Static) {
                 args[0] = b.nullCheckedValue(args[0]);
@@ -84,6 +95,7 @@ public class MethodHandlePlugin implements NodePlugin {
             Invoke invoke = MethodHandleNode.tryResolveTargetInvoke(adder, this::createInvoke, methodHandleAccess, intrinsicMethod, method, b.bci(), invokeReturnStamp, args);
             if (invoke == null) {
                 MacroInvokable methodHandleNode = createMethodHandleNode(b, method, args, intrinsicMethod, invokeKind, invokeReturnStamp);
+                onCreateHook(methodHandleNode, b);
                 if (invokeReturnStamp.getTrustedStamp().getStackKind() == JavaKind.Void) {
                     b.add(methodHandleNode.asNode());
                 } else {
@@ -129,21 +141,23 @@ public class MethodHandlePlugin implements NodePlugin {
                     }
                 }
 
-                /*
-                 * After handleReplacedInvoke, a return type according to the signature of
-                 * targetMethod has been pushed. That can be different than the type expected by the
-                 * method handle invoke. Since there cannot be any implicit type conversion, the
-                 * only safe option actually is that the return type is not used at all. If there is
-                 * any other expected return type, the bytecodes are wrong. The JavaDoc of
-                 * MethodHandle.invokeBasic states that this "could crash the JVM", so bailing out
-                 * of compilation seems like a good idea.
-                 */
-                JavaKind invokeReturnKind = invokeReturnStamp.getTrustedStamp().getStackKind();
-                JavaKind targetMethodReturnKind = targetMethod.getSignature().getReturnKind().getStackKind();
-                if (invokeReturnKind != targetMethodReturnKind) {
-                    b.pop(targetMethodReturnKind);
-                    if (invokeReturnKind != JavaKind.Void) {
-                        throw b.bailout("Cannot do any type conversion when invoking method handle, so return value must remain popped");
+                if (!b.hasParseTerminated()) {
+                    /*
+                     * After handleReplacedInvoke, a return type according to the signature of
+                     * targetMethod has been pushed. That can be different than the type expected by
+                     * the method handle invoke. Since there cannot be any implicit type conversion,
+                     * the only safe option actually is that the return type is not used at all. If
+                     * there is any other expected return type, the bytecodes are wrong. The JavaDoc
+                     * of MethodHandle.invokeBasic states that this "could crash the JVM", so
+                     * bailing out of compilation seems like a good idea.
+                     */
+                    JavaKind invokeReturnKind = invokeReturnStamp.getTrustedStamp().getStackKind();
+                    JavaKind targetMethodReturnKind = targetMethod.getSignature().getReturnKind().getStackKind();
+                    if (invokeReturnKind != targetMethodReturnKind) {
+                        b.pop(targetMethodReturnKind);
+                        if (invokeReturnKind != JavaKind.Void) {
+                            throw b.bailout("Cannot do any type conversion when invoking method handle, so return value must remain popped");
+                        }
                     }
                 }
             }

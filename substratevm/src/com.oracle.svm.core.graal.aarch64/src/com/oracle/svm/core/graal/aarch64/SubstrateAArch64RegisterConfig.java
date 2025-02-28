@@ -48,8 +48,6 @@ import static jdk.vm.ci.aarch64.AArch64.r4;
 import static jdk.vm.ci.aarch64.AArch64.r5;
 import static jdk.vm.ci.aarch64.AArch64.r6;
 import static jdk.vm.ci.aarch64.AArch64.r7;
-import static jdk.vm.ci.aarch64.AArch64.r8;
-import static jdk.vm.ci.aarch64.AArch64.r9;
 import static jdk.vm.ci.aarch64.AArch64.v0;
 import static jdk.vm.ci.aarch64.AArch64.v1;
 import static jdk.vm.ci.aarch64.AArch64.v10;
@@ -70,7 +68,7 @@ import static jdk.vm.ci.aarch64.AArch64.zr;
 
 import java.util.ArrayList;
 
-import jdk.graal.compiler.core.common.NumUtil;
+import com.oracle.svm.core.aarch64.SubstrateAArch64MacroAssembler;
 import org.graalvm.nativeimage.Platform;
 
 import com.oracle.svm.core.ReservedRegisters;
@@ -81,6 +79,7 @@ import com.oracle.svm.core.graal.code.SubstrateCallingConventionType;
 import com.oracle.svm.core.graal.meta.SubstrateRegisterConfig;
 import com.oracle.svm.core.util.VMError;
 
+import jdk.graal.compiler.core.common.NumUtil;
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.code.CallingConvention;
 import jdk.vm.ci.code.CallingConvention.Type;
@@ -95,7 +94,6 @@ import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.PlatformKind;
-import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Value;
 import jdk.vm.ci.meta.ValueKind;
 
@@ -134,9 +132,11 @@ public class SubstrateAArch64RegisterConfig implements SubstrateRegisterConfig {
         ArrayList<Register> regs = new ArrayList<>(allRegisters.asList());
         regs.remove(ReservedRegisters.singleton().getFrameRegister()); // sp
         regs.remove(zr);
+
         // Scratch registers.
-        regs.remove(r8);
-        regs.remove(r9);
+        regs.remove(SubstrateAArch64MacroAssembler.scratch1);
+        regs.remove(SubstrateAArch64MacroAssembler.scratch2);
+
         if (preserveFramePointer) {
             regs.remove(fp); // r29
         }
@@ -290,14 +290,16 @@ public class SubstrateAArch64RegisterConfig implements SubstrateRegisterConfig {
         int currentFP = 0;
 
         /*
-         * We have to reserve a slot between return address and outgoing parameters for the deopt
-         * frame handle. Exception: calls to native methods.
+         * We have to reserve a slot between return address and outgoing parameters for the
+         * deoptimized frame (eager deoptimization), or the original return address (lazy
+         * deoptimization). Exception: calls to native methods.
          */
         int currentStackOffset = (type.nativeABI() ? nativeParamsStackOffset : target.wordSize);
 
         JavaKind[] kinds = new JavaKind[locations.length];
+        boolean isDarwinPlatform = Platform.includedIn(Platform.DARWIN.class);
         for (int i = 0; i < parameterTypes.length; i++) {
-            JavaKind kind = ObjectLayout.getCallSignatureKind(isEntryPoint, (ResolvedJavaType) parameterTypes[i], metaAccess, target);
+            JavaKind kind = ObjectLayout.getCallSignatureKind(isEntryPoint, parameterTypes[i], metaAccess, target);
             kinds[i] = kind;
 
             Register register = null;
@@ -340,16 +342,14 @@ public class SubstrateAArch64RegisterConfig implements SubstrateRegisterConfig {
                  * Darwin deviates from the call standard and requires the caller to extend subword
                  * values.
                  */
-                boolean useJavaKind = isEntryPoint && (Platform.includedIn(Platform.LINUX.class) || Platform.includedIn(Platform.WINDOWS.class));
+                boolean useJavaKind = isEntryPoint && !isDarwinPlatform;
                 locations[i] = register.asValue(valueKindFactory.getValueKind(useJavaKind ? kind : kind.getStackKind()));
             } else {
                 if (type.nativeABI()) {
-                    if (Platform.includedIn(Platform.LINUX.class)) {
-                        currentStackOffset = linuxNativeStackParameterAssignment(valueKindFactory, locations, i, kind, currentStackOffset, type.outgoing);
-                    } else if (Platform.includedIn(Platform.DARWIN.class)) {
+                    if (isDarwinPlatform) {
                         currentStackOffset = darwinNativeStackParameterAssignment(valueKindFactory, locations, i, kind, currentStackOffset, type.outgoing);
                     } else {
-                        throw VMError.unsupportedPlatform(); // ExcludeFromJacocoGeneratedReport
+                        currentStackOffset = linuxNativeStackParameterAssignment(valueKindFactory, locations, i, kind, currentStackOffset, type.outgoing);
                     }
                 } else {
                     currentStackOffset = javaStackParameterAssignment(valueKindFactory, locations, i, kind, currentStackOffset, type.outgoing);
@@ -357,7 +357,7 @@ public class SubstrateAArch64RegisterConfig implements SubstrateRegisterConfig {
             }
         }
 
-        JavaKind returnKind = returnType == null ? JavaKind.Void : ObjectLayout.getCallSignatureKind(isEntryPoint, (ResolvedJavaType) returnType, metaAccess, target);
+        JavaKind returnKind = returnType == null ? JavaKind.Void : ObjectLayout.getCallSignatureKind(isEntryPoint, returnType, metaAccess, target);
         AllocatableValue returnLocation = returnKind == JavaKind.Void ? Value.ILLEGAL : getReturnRegister(returnKind).asValue(valueKindFactory.getValueKind(returnKind.getStackKind()));
         return new SubstrateCallingConvention(type, kinds, currentStackOffset, returnLocation, locations);
     }

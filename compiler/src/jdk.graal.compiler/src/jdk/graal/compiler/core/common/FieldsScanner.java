@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,13 +24,12 @@
  */
 package jdk.graal.compiler.core.common;
 
-import static jdk.graal.compiler.serviceprovider.GraalUnsafeAccess.getUnsafe;
-
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.Comparator;
 
-import sun.misc.Unsafe;
+import jdk.internal.misc.Unsafe;
 
 /**
  * Scans the fields in a class hierarchy.
@@ -50,9 +49,8 @@ public class FieldsScanner {
      */
     public static class DefaultCalcOffset implements CalcOffset {
 
-        private static final Unsafe UNSAFE = getUnsafe();
+        private static final Unsafe UNSAFE = Unsafe.getUnsafe();
 
-        @SuppressWarnings("deprecation"/* JDK-8277863 */)
         @Override
         public long getOffset(Field field) {
             return UNSAFE.objectFieldOffset(field);
@@ -63,6 +61,21 @@ public class FieldsScanner {
      * Describes a field in a class during {@linkplain FieldsScanner scanning}.
      */
     public static class FieldInfo implements Comparable<FieldInfo> {
+
+        /**
+         * Sorts fields in ascending order by {@code field name + declaring class name + type name}.
+         */
+        public static final Comparator<FieldInfo> STABLE_COMPARATOR = (o1, o2) -> {
+            int res = o1.name.compareTo(o2.name);
+            if (res == 0) {
+                res = o1.declaringClass.getName().compareTo(o2.declaringClass.getName());
+                if (res == 0) {
+                    res = o1.type.getName().compareTo(o2.type.getName());
+                }
+            }
+            return res;
+        };
+
         public final long offset;
         public final String name;
         public final Class<?> type;

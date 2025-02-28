@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -153,11 +153,11 @@ public class ExportMethodTest extends AbstractLibraryTest {
         assertEquals("foo", getUncached(ExportsTestLibrary1.class, o).foo(o, 42));
     }
 
-    private static class TestSubInterface implements TestInterface {
+    private static final class TestSubInterface implements TestInterface {
 
     }
 
-    private static class TestSubClass extends TestClass {
+    private static final class TestSubClass extends TestClass {
 
     }
 
@@ -452,6 +452,9 @@ public class ExportMethodTest extends AbstractLibraryTest {
             return "foo1";
         }
 
+        private static String foo2() {
+            return "foo2";
+        }
     }
 
     @ExpectError("Exported library ExportsTestLibrary3 does not export any messages and therefore has no effect. Remove the export declaration to resolve this.")

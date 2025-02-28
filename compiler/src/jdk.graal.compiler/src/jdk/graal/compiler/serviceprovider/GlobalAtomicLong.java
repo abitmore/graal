@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,8 +26,14 @@ package jdk.graal.compiler.serviceprovider;
 
 import java.lang.ref.Cleaner;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
-import sun.misc.Unsafe;
+import jdk.graal.compiler.core.common.LibGraalSupport;
+import jdk.graal.compiler.debug.GraalError;
+import jdk.internal.misc.Unsafe;
+import org.graalvm.nativeimage.ImageInfo;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
 
 /**
  * A shareable long value in the JVM process that is updated atomically. The long value is stored in
@@ -39,17 +45,29 @@ import sun.misc.Unsafe;
  */
 public class GlobalAtomicLong {
 
-    private static final Unsafe UNSAFE = GraalUnsafeAccess.getUnsafe();
+    private static final Unsafe UNSAFE = Unsafe.getUnsafe();
 
     /**
-     * Cleaner for freeing {@link #address}.
+     * Cleaner for freeing {@link #address} when executing in jargraal.
      */
+    @Platforms(Platform.HOSTED_ONLY.class) //
     private static Cleaner cleaner;
+
+    /**
+     * Name of the global. This is only used for {@link #toString()} and is not guaranteed to be
+     * unique.
+     */
+    private final String name;
 
     /**
      * Address of native memory storing the long value.
      */
     private volatile long address;
+
+    /**
+     * Supplies the address of the global memory storing the global value.
+     */
+    private final Supplier<Long> addressSupplier;
 
     /**
      * Value to which the value will be initialized.
@@ -61,8 +79,33 @@ public class GlobalAtomicLong {
      *
      * @param initialValue initial value to which the long is set when its memory is allocated
      */
-    public GlobalAtomicLong(long initialValue) {
+    public GlobalAtomicLong(String name, long initialValue) {
+        this.name = name;
         this.initialValue = initialValue;
+        if (ImageInfo.inImageRuntimeCode()) {
+            throw GraalError.shouldNotReachHere("Cannot create " + getClass().getName() + " objects in native image runtime");
+        } else {
+            LibGraalSupport libgraal = LibGraalSupport.INSTANCE;
+            if (libgraal != null) {
+                if (ImageInfo.inImageRuntimeCode()) {
+                    throw GraalError.shouldNotReachHere("The addressSupplier field value should have been replaced at image build time");
+                }
+                addressSupplier = libgraal.createGlobal(initialValue);
+            } else {
+                // Executing in jargraal
+                addressSupplier = () -> {
+                    long addr = UNSAFE.allocateMemory(Long.BYTES);
+                    synchronized (GlobalAtomicLong.class) {
+                        if (cleaner == null) {
+                            cleaner = Cleaner.create();
+                        }
+                        cleaner.register(GlobalAtomicLong.this, () -> UNSAFE.freeMemory(addr));
+                    }
+                    UNSAFE.putLongVolatile(null, addr, initialValue);
+                    return addr;
+                };
+            }
+        }
     }
 
     public long getInitialValue() {
@@ -71,28 +114,18 @@ public class GlobalAtomicLong {
 
     @Override
     public String toString() {
-        long addr = getAddress();
-        if (addr == 0L) {
-            return String.valueOf(initialValue);
+        if (address == 0L) {
+            return name + ":" + initialValue;
         } else {
-            return String.format("%d (@0x%x)", get(), addr);
+            return String.format("%s:%d(@0x%x)", name, get(), address);
         }
     }
 
-    // Substituted by Target_jdk_graal_compiler_serviceprovider_GlobalAtomicLong
     private long getAddress() {
         if (address == 0L) {
             synchronized (this) {
                 if (address == 0L) {
-                    long addr = UNSAFE.allocateMemory(Long.BYTES);
-                    synchronized (GlobalAtomicLong.class) {
-                        if (cleaner == null) {
-                            cleaner = Cleaner.create();
-                        }
-                        cleaner.register(this, () -> UNSAFE.freeMemory(addr));
-                    }
-                    UNSAFE.putLongVolatile(null, addr, initialValue);
-                    address = addr;
+                    address = addressSupplier.get();
                 }
             }
         }
@@ -166,6 +199,6 @@ public class GlobalAtomicLong {
      * @see AtomicLong#compareAndSet(long, long)
      */
     public boolean compareAndSet(long expectedValue, long newValue) {
-        return UNSAFE.compareAndSwapLong(null, getAddress(), expectedValue, newValue);
+        return UNSAFE.compareAndSetLong(null, getAddress(), expectedValue, newValue);
     }
 }

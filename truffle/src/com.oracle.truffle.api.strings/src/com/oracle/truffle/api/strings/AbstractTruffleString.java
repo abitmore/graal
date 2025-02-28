@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -50,10 +50,14 @@ import static com.oracle.truffle.api.strings.TStringGuards.isBytes;
 import static com.oracle.truffle.api.strings.TStringGuards.isLatin1;
 import static com.oracle.truffle.api.strings.TStringGuards.isSupportedEncoding;
 import static com.oracle.truffle.api.strings.TStringGuards.isUTF16;
+import static com.oracle.truffle.api.strings.TStringGuards.isUTF16FE;
 import static com.oracle.truffle.api.strings.TStringGuards.isUTF32;
+import static com.oracle.truffle.api.strings.TStringGuards.isUTF32FE;
 import static com.oracle.truffle.api.strings.TStringGuards.isUTF8;
 import static com.oracle.truffle.api.strings.TStringGuards.isValidFixedWidth;
 import static com.oracle.truffle.api.strings.TStringGuards.isValidMultiByte;
+
+import java.lang.ref.Reference;
 
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
@@ -132,7 +136,7 @@ public abstract sealed class AbstractTruffleString permits TruffleString, Mutabl
         assert isByte(stride);
         assert isByte(flags);
         assert validateCodeRange(encoding, codeRange);
-        assert isSupportedEncoding(encoding) || TStringAccessor.ENGINE.requireLanguageWithAllEncodings(encoding);
+        assert isSupportedEncoding(encoding) || isUTF16FE(encoding) || isUTF32FE(encoding) || length == 0 || JCodings.ENABLED;
         this.data = data;
         this.encoding = encoding.id;
         this.offset = offset;
@@ -297,7 +301,6 @@ public abstract sealed class AbstractTruffleString permits TruffleString, Mutabl
 
     final void setData(byte[] array) {
         if (offset() != 0 || length() << stride() != array.length) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
             throw CompilerDirectives.shouldNotReachHere();
         }
         this.data = array;
@@ -457,23 +460,23 @@ public abstract sealed class AbstractTruffleString permits TruffleString, Mutabl
 
     static int rawIndex(int byteIndex, TruffleString.Encoding expectedEncoding) {
         if (isUTF16(expectedEncoding) && (byteIndex & 1) != 0) {
-            throw InternalErrors.illegalArgument("misaligned byte index on UTF-16 string");
+            throw InternalErrors.illegalArgument("misaligned byte index %d on UTF-16 string", byteIndex);
         } else if (isUTF32(expectedEncoding) && (byteIndex & 3) != 0) {
-            throw InternalErrors.illegalArgument("misaligned byte index on UTF-32 string");
+            throw InternalErrors.illegalArgument("misaligned byte index %d on UTF-32 string", byteIndex);
         }
         return byteIndex >> expectedEncoding.naturalStride;
     }
 
     static int rawIndexUTF16(int byteIndex) {
         if ((byteIndex & 1) != 0) {
-            throw InternalErrors.illegalArgument("misaligned byte index on UTF-16 string");
+            throw InternalErrors.illegalArgument("misaligned byte index %d on UTF-16 string", byteIndex);
         }
         return byteIndex >> Encoding.UTF_16.naturalStride;
     }
 
     static int rawIndexUTF32(int byteIndex) {
         if ((byteIndex & 3) != 0) {
-            throw InternalErrors.illegalArgument("misaligned byte index on UTF-32 string");
+            throw InternalErrors.illegalArgument("misaligned byte index %d on UTF-32 string", byteIndex);
         }
         return byteIndex >> Encoding.UTF_32.naturalStride;
     }
@@ -515,7 +518,7 @@ public abstract sealed class AbstractTruffleString permits TruffleString, Mutabl
 
     final void boundsCheckRawLength(int index) {
         if (Integer.compareUnsigned(index, length()) > 0) {
-            throw InternalErrors.indexOutOfBounds();
+            throw InternalErrors.indexOutOfBounds(length(), index);
         }
     }
 
@@ -530,41 +533,41 @@ public abstract sealed class AbstractTruffleString permits TruffleString, Mutabl
     static void boundsCheckI(int index, int arrayLength) {
         assert arrayLength >= 0;
         if (Integer.compareUnsigned(index, arrayLength) >= 0) {
-            throw InternalErrors.indexOutOfBounds();
+            throw InternalErrors.indexOutOfBounds(arrayLength, index);
         }
     }
 
     static void boundsCheckI(int fromIndex, int toIndex, int arrayLength) {
         assert arrayLength >= 0;
         if (Integer.compareUnsigned(fromIndex, arrayLength) >= 0 || Integer.compareUnsigned(toIndex, arrayLength) > 0) {
-            throw InternalErrors.indexOutOfBounds();
+            throw InternalErrors.indexRegionOutOfBounds(arrayLength, fromIndex, toIndex);
         }
     }
 
     static void boundsCheckRegionI(int fromIndex, int regionLength, int arrayLength) {
         assert arrayLength >= 0;
         if (Integer.toUnsignedLong(fromIndex) + Integer.toUnsignedLong(regionLength) > arrayLength) {
-            throw InternalErrors.indexOutOfBounds();
+            throw InternalErrors.regionOutOfBounds(arrayLength, fromIndex, regionLength);
         }
     }
 
     static void checkByteLength(int byteLength, Encoding encoding) {
-        if (isUTF16(encoding)) {
+        if (isUTF16(encoding) || isUTF16FE(encoding)) {
             TruffleString.checkByteLengthUTF16(byteLength);
-        } else if (isUTF32(encoding)) {
+        } else if (isUTF32(encoding) || isUTF32FE(encoding)) {
             TruffleString.checkByteLengthUTF32(byteLength);
         }
     }
 
     static void checkByteLengthUTF16(int byteLength) {
         if ((byteLength & 1) != 0) {
-            throw InternalErrors.illegalByteArrayLength("UTF-16 string byte length is not a multiple of 2");
+            throw InternalErrors.illegalByteArrayLength("UTF-16 string byte length (%d) is not a multiple of 2", byteLength);
         }
     }
 
     static void checkByteLengthUTF32(int byteLength) {
         if ((byteLength & 3) != 0) {
-            throw InternalErrors.illegalByteArrayLength("UTF-32 string byte length is not a multiple of 4");
+            throw InternalErrors.illegalByteArrayLength("UTF-32 string byte length (%d) is not a multiple of 4", byteLength);
         }
     }
 
@@ -574,7 +577,7 @@ public abstract sealed class AbstractTruffleString permits TruffleString, Mutabl
 
     static void checkArrayRange(int arrayLength, int byteOffset, int byteLength) {
         if (Integer.toUnsignedLong(byteOffset) + Integer.toUnsignedLong(byteLength) > arrayLength) {
-            throw InternalErrors.substringOutOfBounds();
+            throw InternalErrors.regionOutOfBounds(arrayLength, byteOffset, byteLength);
         }
     }
 
@@ -1461,11 +1464,17 @@ public abstract sealed class AbstractTruffleString permits TruffleString, Mutabl
          * the native pointer's lifetime depends on the pointer object's lifetime.
          */
         private final Object pointerObject;
+        /**
+         * The raw native pointer.
+         * <p>
+         * NOTE: any use of this pointer must be guarded by a reachability fence on
+         * {@link #pointerObject}!
+         */
         final long pointer;
         private byte[] bytes;
         private volatile boolean byteArrayIsValid = false;
 
-        private NativePointer(Object pointerObject, long pointer) {
+        NativePointer(Object pointerObject, long pointer) {
             this.pointerObject = pointerObject;
             this.pointer = pointer;
         }
@@ -1499,8 +1508,12 @@ public abstract sealed class AbstractTruffleString permits TruffleString, Mutabl
                 if (bytes == null) {
                     bytes = new byte[byteLength];
                 }
-                TStringUnsafe.copyFromNative(pointer, byteOffset, bytes, 0, byteLength);
-                byteArrayIsValid = true;
+                try {
+                    TStringUnsafe.copyFromNative(pointer, byteOffset, bytes, 0, byteLength);
+                    byteArrayIsValid = true;
+                } finally {
+                    Reference.reachabilityFence(pointerObject);
+                }
             }
         }
 

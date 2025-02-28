@@ -156,13 +156,16 @@
     #error platform not supported or undefined
 #endif
 
-typedef jint(*CreateJVM)(JavaVM **, void **, void *);
+// jint JNI_CreateJavaVM(JavaVM **p_vm, void **p_env, void *vm_args);
+typedef jint(*CreateJavaVM_type)(JavaVM **, void **, void *);
+// jint JNI_GetDefaultJavaVMInitArgs(void *vm_args);
+typedef jint(*GetDefaultJavaVMInitArgs_type)(void *);
+
 extern char **environ;
 
 static bool debug = false;
 static bool relaunch = false;
 static bool found_switch_to_jvm_flag = false;
-static const char *svm_error = NULL;
 
 /* platform-independent environment setter, use empty value to clear */
 static int setenv(std::string key, std::string value) {
@@ -209,6 +212,23 @@ static std::string exe_path() {
     #elif defined (_WIN32)
         char *realPath = (char *)malloc(_MAX_PATH);
         GetModuleFileNameA(NULL, realPath, _MAX_PATH);
+        /* try to do a realpath equivalent */
+        HANDLE handle = CreateFile(realPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (handle != INVALID_HANDLE_VALUE) {
+            const size_t size = _MAX_PATH + 4;
+            char *resolvedPath = (char *)malloc(size);
+            DWORD ret = GetFinalPathNameByHandleA(handle, resolvedPath, size, 0);
+            /*
+             * The path returned from GetFinalPathNameByHandleA should always
+             * use "\\?\" path syntax. We strip the prefix.
+             * See: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+             */
+            if (ret < size && resolvedPath[0] == '\\' && resolvedPath[1] == '\\' && resolvedPath[2] == '?' && resolvedPath[3] == '\\') {
+                strcpy_s(realPath, _MAX_PATH, resolvedPath + 4);
+            }
+            free(resolvedPath);
+            CloseHandle(handle);
+        }
     #endif
     std::string p(realPath);
     free(realPath);
@@ -262,15 +282,15 @@ static void *load_jli_lib(std::string exeDir) {
 #endif
 
 /* load the language library (either native library or libjvm) and return a
- * pointer to the JNI_CreateJavaVM function */
-static CreateJVM load_vm_lib(std::string liblangPath) {
+ * pointer to it */
+void* load_vm_lib(std::string liblangPath) {
     if (debug) {
         std::cout << "Loading library " << liblangPath << std::endl;
     }
 #if defined (__linux__) || defined (__APPLE__)
         void* jvmHandle = dlopen(liblangPath.c_str(), RTLD_NOW);
         if (jvmHandle != NULL) {
-            return (CreateJVM) dlsym(jvmHandle, "JNI_CreateJavaVM");
+            return jvmHandle;
         }
         char* errorString = dlerror();
         if (errorString != NULL) {
@@ -279,8 +299,22 @@ static CreateJVM load_vm_lib(std::string liblangPath) {
 #else
         HMODULE jvmHandle = LoadLibraryA(liblangPath.c_str());
         if (jvmHandle != NULL) {
-            return (CreateJVM) GetProcAddress(jvmHandle, "JNI_CreateJavaVM");
+            return (void*) jvmHandle;
         }
+#endif
+    return NULL;
+}
+
+void* get_function(void* library, const char* function_name) {
+    if (!library) {
+        return NULL;
+    }
+#if defined (__linux__) || defined (__APPLE__)
+        void* jvmHandle = library;
+        return dlsym(jvmHandle, function_name);
+#else
+        HMODULE jvmHandle = (HMODULE) library;
+        return GetProcAddress(jvmHandle, function_name);
 #endif
     return NULL;
 }
@@ -326,9 +360,7 @@ static void parse_vm_option(
 }
 
 /* parse the VM arguments that should be passed to JNI_CreateJavaVM */
-static void parse_vm_options(int argc, char **argv, std::string exeDir, JavaVMInitArgs *vmInitArgs, bool jvmMode) {
-    std::vector<std::string> vmArgs;
-
+static void parse_vm_options(int argc, char **argv, std::string exeDir, std::vector<std::string>& vmArgs, std::vector<std::string>& optionVarsArgs, bool jvmMode) {
     /* check if vm args have been set on relaunch already */
     int vmArgCount = 0;
     char *vmArgInfo = getenv("GRAALVM_LANGUAGE_LAUNCHER_VMARGS");
@@ -476,7 +508,8 @@ static void parse_vm_options(int argc, char **argv, std::string exeDir, JavaVMIn
     #endif
 
     /* Handle launcher default vm arguments. We apply these first, so they can
-       be overridden by explicit arguments on the commandline. */
+       be overridden by explicit arguments on the commandline.
+       These should be added even if relaunch is true because they are not passed to preprocessArguments(). */
     #ifdef LAUNCHER_DEFAULT_VM_ARGS
     const char *launcherDefaultVmArgs[] = LAUNCHER_DEFAULT_VM_ARGS;
     for (int i = 0; i < sizeof(launcherDefaultVmArgs)/sizeof(char*); i++) {
@@ -486,15 +519,43 @@ static void parse_vm_options(int argc, char **argv, std::string exeDir, JavaVMIn
     }
     #endif
 
-    /* handle CLI arguments */
-    if (!vmArgInfo) {
+
+    if (!relaunch) {
+        /* handle CLI arguments */
         for (int i = 0; i < argc; i++) {
             parse_vm_option(&vmArgs, &cp, &modulePath, &libraryPath, std::string(argv[i]));
         }
-    }
 
-    /* handle relaunch arguments */
-    else {
+        /* handle optional vm args from LanguageLibraryConfig.option_vars */
+        #ifdef LAUNCHER_OPTION_VARS
+        for (int i = 0; i < sizeof(launcherOptionVars)/sizeof(char*); i++) {
+            char *optionVar = getenv(launcherOptionVars[i]);
+            if (!optionVar) {
+                continue;
+            }
+            if (debug) {
+                std::cout << "Launcher option_var found: " << launcherOptionVars[i] << "=" << optionVar << std::endl;
+            }
+            // we split on spaces
+            std::string optionLine(optionVar);
+            size_t last = 0;
+            size_t next = 0;
+            std::string option;
+            while ((next = optionLine.find(" ", last)) != std::string::npos) {
+                option = optionLine.substr(last, next-last);
+                optionVarsArgs.push_back(option);
+                parse_vm_option(&vmArgs, &cp, &modulePath, &libraryPath, option);
+                last = next + 1;
+            };
+            option = optionLine.substr(last);
+            optionVarsArgs.push_back(option);
+            parse_vm_option(&vmArgs, &cp, &modulePath, &libraryPath, option);
+        }
+        #endif
+    } else {
+        /* Handle relaunch arguments. In that case GRAALVM_LANGUAGE_LAUNCHER_VMARGS_* contain all --vm.* arguments
+           returned by preprocessArguments(), so we should not look at CLI args and option_vars as that would cause
+           to add extra duplicate --vm.* arguments. */
         if (debug) {
             std::cout << "Relaunch environment variable detected" << std::endl;
         }
@@ -513,29 +574,6 @@ static void parse_vm_options(int argc, char **argv, std::string exeDir, JavaVMIn
         }
     }
 
-    /* handle optional vm args from LanguageLibraryConfig.option_vars */
-    #ifdef LAUNCHER_OPTION_VARS
-    for (int i = 0; i < sizeof(launcherOptionVars)/sizeof(char*); i++) {
-        char *optionVar = getenv(launcherOptionVars[i]);
-        if (!optionVar) {
-            continue;
-        }
-        if (debug) {
-            std::cout << "Launcher option_var found: " << launcherOptionVars[i] << "=" << optionVar << std::endl;
-        }
-        // we split on spaces
-        std::string optionLine(optionVar);
-        size_t last = 0;
-        size_t next = 0;
-        while ((next = optionLine.find(" ", last)) != std::string::npos) {
-            std::string option = optionLine.substr(last, next-last);
-            parse_vm_option(&vmArgs, &cp, &modulePath, &libraryPath, option);
-            last = next + 1;
-        };
-        parse_vm_option(&vmArgs, &cp, &modulePath, &libraryPath, optionLine.substr(last));
-    }
-    #endif
-
     /* set classpath and module path arguments - only needed for jvm mode */
     if (jvmMode) {
         if (!cp.str().empty()) {
@@ -549,33 +587,9 @@ static void parse_vm_options(int argc, char **argv, std::string exeDir, JavaVMIn
         vmArgs.push_back("-Djdk.module.main=" LAUNCHER_MAIN_MODULE_STR);
         vmArgs.push_back("-Dgraalvm.locatorDisabled=true");
 #endif
-    }
 
-    jint nOptions = jvmMode ? vmArgs.size() : 1 + vmArgs.size();
-    vmInitArgs->options = new JavaVMOption[nOptions];
-    vmInitArgs->nOptions = nOptions;
-    JavaVMOption *curOpt = vmInitArgs->options;
-
-    if (!jvmMode) {
-        curOpt->optionString = strdup("_createvm_errorstr");
-        curOpt->extraInfo = &svm_error;
-        curOpt++;
-    }
-
-    for(const auto& arg: vmArgs) {
-        if (debug) {
-            std::cout << "Setting VM argument " << arg << std::endl;
-        }
-        /* env variable for native memory tracking (NMT), obsolete with JDK 18 */
-        size_t nmtPos = arg.find(NMT_ARG_NAME);
-        if (nmtPos != std::string::npos) {
-            nmtPos += sizeof(NMT_ARG_NAME);
-            std::string val = arg.substr(nmtPos);
-            std::string pid = std::to_string(getpid());
-            setenv(std::string(NMT_ENV_NAME) + pid, val);
-        }
-        curOpt->optionString = strdup(arg.c_str());
-        curOpt++;
+        /* Allow Truffle NFI Panama to use Linker#{downcallHandle,upcallStub} without warnings. */
+        vmArgs.push_back("--enable-native-access=org.graalvm.truffle");
     }
 }
 
@@ -683,42 +697,103 @@ int main(int argc, char *argv[]) {
 
 static int jvm_main_thread(int argc, char *argv[], std::string exeDir, bool jvmMode, std::string libPath) {
     /* parse VM args */
-    JavaVM *vm;
-    JNIEnv *env;
+    std::vector<std::string> vmArgs;
+    std::vector<std::string> optionVarsArgs;
+    parse_vm_options(argc, argv, exeDir, vmArgs, optionVarsArgs, jvmMode);
+
+    /* load VM library - after parsing arguments s.t. NMT
+     * tracking environment variables are already set */
+    void* library = load_vm_lib(libPath);
+    if (!library) {
+        std::cerr << "Could not load VM library from " << libPath << "." << std::endl;
+        return -1;
+    }
+
+    if (jvmMode) {
+        GetDefaultJavaVMInitArgs_type getDefaultJavaVMInitArgs = (GetDefaultJavaVMInitArgs_type) get_function(library, "JNI_GetDefaultJavaVMInitArgs");
+        if (!getDefaultJavaVMInitArgs) {
+            std::cerr << "Could not find JNI_GetDefaultJavaVMInitArgs." << std::endl;
+            return -1;
+        }
+
+        #ifndef JNI_VERSION_24
+        #define JNI_VERSION_24 0x00180000
+        #endif
+
+        JavaVMInitArgs defaultArgs;
+        defaultArgs.version = JNI_VERSION_24;
+        defaultArgs.nOptions = 0;
+        defaultArgs.options = NULL;
+        defaultArgs.ignoreUnrecognized = false;
+        bool jdk24_or_higher = getDefaultJavaVMInitArgs(&defaultArgs) == JNI_OK;
+
+        if (jdk24_or_higher) {
+            // GR-59703: Migrate sun.misc.* usages.
+            vmArgs.push_back("--sun-misc-unsafe-memory-access=allow");
+        }
+    }
+
+    // Convert vmArgs to JavaVMInitArgs
+    jint nOptions = jvmMode ? vmArgs.size() : 1 + vmArgs.size();
+    JavaVMOption *options = new JavaVMOption[nOptions];
+    JavaVMOption *curOpt = options;
+
+    const char *svm_error = NULL;
+    if (!jvmMode) {
+        curOpt->optionString = strdup("_createvm_errorstr");
+        curOpt->extraInfo = &svm_error;
+        curOpt++;
+    }
+
+    for (const auto& arg: vmArgs) {
+        if (debug) {
+            std::cout << "Setting VM argument " << arg << std::endl;
+        }
+        /* env variable for native memory tracking (NMT), obsolete with JDK 18 */
+        size_t nmtPos = arg.find(NMT_ARG_NAME);
+        if (nmtPos != std::string::npos) {
+            nmtPos += sizeof(NMT_ARG_NAME);
+            std::string val = arg.substr(nmtPos);
+            std::string pid = std::to_string(getpid());
+            setenv(std::string(NMT_ENV_NAME) + pid, val);
+        }
+        curOpt->optionString = strdup(arg.c_str());
+        curOpt++;
+    }
+
+    CreateJavaVM_type createVM = (CreateJavaVM_type) get_function(library, "JNI_CreateJavaVM");
+    if (!createVM) {
+        std::cerr << "Could not find JNI_CreateJavaVM." << std::endl;
+        return -1;
+    }
+
     JavaVMInitArgs vmInitArgs;
-    vmInitArgs.nOptions = 0;
-    parse_vm_options(argc, argv, exeDir, &vmInitArgs, jvmMode);
     vmInitArgs.version = JNI_VERSION_9;
+    vmInitArgs.nOptions = nOptions;
+    vmInitArgs.options = options;
     /* In general we want to validate VM arguments.
      * But we must disable it for the case there is a native library and we saw a --jvm argument,
      * as the VM arguments are then JVM VM arguments and not SVM VM arguments.
      * In that case we validate them after the execve() when running in --jvm mode. */
     vmInitArgs.ignoreUnrecognized = found_switch_to_jvm_flag && !jvmMode;
 
-    /* load VM library - after parsing arguments s.t. NMT
-     * tracking variable is already set */
-    CreateJVM createVM = load_vm_lib(libPath);
-    if (!createVM) {
-        std::cerr << "Could not load JVM." << std::endl;
-        return -1;
-    }
-
-    int res = createVM(&vm, (void**)&env, &vmInitArgs);
-    if (res != JNI_OK) {
+    JavaVM *vm;
+    JNIEnv *env;
+    if (createVM(&vm, (void**)&env, &vmInitArgs) != JNI_OK) {
         if (svm_error != NULL) {
             std::cerr << svm_error << std::endl;
             free((void*) svm_error);
             svm_error = NULL;
         }
-        std::cerr << "Creation of the VM failed." << std::endl;
+        std::cerr << "JNI_CreateJavaVM() failed." << std::endl;
         return -1;
     }
 
     /* free the allocated vm arguments */
-    for (int i = 0; i < vmInitArgs.nOptions; i++) {
-        free(vmInitArgs.options[i].optionString);
+    for (int i = 0; i < nOptions; i++) {
+        free(options[i].optionString);
     }
-    delete vmInitArgs.options;
+    delete options;
 
     jclass byteArrayClass = env->FindClass("[B");
     if (byteArrayClass == NULL) {
@@ -744,7 +819,7 @@ static int jvm_main_thread(int argc, char *argv[], std::string exeDir, bool jvmM
         }
         return -1;
     }
-    jmethodID runLauncherMid = env->GetStaticMethodID(launcherClass, "runLauncher", "([[BIJZ)V");
+    jmethodID runLauncherMid = env->GetStaticMethodID(launcherClass, "runLauncher", "([[B[[BIJZ)V");
     if (runLauncherMid == NULL) {
         std::cerr << "Launcher entry point not found." << std::endl;
         if (env->ExceptionCheck()) {
@@ -787,8 +862,28 @@ static int jvm_main_thread(int argc, char *argv[], std::string exeDir, bool jvmM
         }
     }
 
+    /* create env var args string array */
+    jobjectArray optionVarsArgsArray = env->NewObjectArray(optionVarsArgs.size(), byteArrayClass, NULL);
+    for (int i = 0; i < optionVarsArgs.size(); i++) {
+        std::string argString = optionVarsArgs[i];
+        jbyteArray arg = env->NewByteArray(argString.length());
+        env->SetByteArrayRegion(arg, 0, argString.length(), (jbyte *)(argString.c_str()));
+        if (env->ExceptionCheck()) {
+            std::cerr << "Error in SetByteArrayRegion:" << std::endl;
+            env->ExceptionDescribe();
+            return -1;
+        }
+        env->SetObjectArrayElement(optionVarsArgsArray, i, arg);
+        if (env->ExceptionCheck()) {
+            std::cerr << "Error in SetObjectArrayElement:" << std::endl;
+            env->ExceptionDescribe();
+            return -1;
+        }
+    }
+
     /* invoke launcher entry point */
-    env->CallStaticVoidMethod(launcherClass, runLauncherMid, args, argc_native, (jlong)(uintptr_t)(void*)argv_native, relaunch);
+    jlong argv_native_long = (jlong)(uintptr_t)(void*)argv_native;
+    env->CallStaticVoidMethod(launcherClass, runLauncherMid, optionVarsArgsArray, args, argc_native, argv_native_long, relaunch);
     jthrowable t = env->ExceptionOccurred();
     if (t) {
         if (env->IsInstanceOf(t, relaunchExceptionClass)) {
@@ -823,7 +918,7 @@ static int jvm_main_thread(int argc, char *argv[], std::string exeDir, bool jvmM
                     std::cerr << "Error in GetObjectArrayElement:" << std::endl;
                     env->ExceptionDescribe();
                     return -1;
-                }    
+                }
                 const char *vmArg = env->GetStringUTFChars(vmArgString, NULL);
                 if (env->ExceptionCheck()) {
                     std::cerr << "Error in GetStringUTFChars:" << std::endl;

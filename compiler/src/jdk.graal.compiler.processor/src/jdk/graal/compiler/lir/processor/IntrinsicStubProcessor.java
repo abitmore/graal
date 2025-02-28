@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -72,6 +72,7 @@ public class IntrinsicStubProcessor extends AbstractProcessor {
     private TypeElement generateStub;
     private TypeElement generateStubs;
     private TypeMirror constantNodeParameter;
+    private boolean malformedInput = false;
 
     @Override
     public Set<String> getSupportedAnnotationTypes() {
@@ -182,10 +183,12 @@ public class IntrinsicStubProcessor extends AbstractProcessor {
                     }
                     classes.add(new GenerateStubClass(source, stubs, minimumFeatureGetters.keySet()));
                 }
-                createStubs(this, targetVM, (TypeElement) holder, classes);
+                if (!malformedInput) {
+                    createStubs(this, targetVM, (TypeElement) holder, classes);
+                }
             }
         }
-        return false;
+        return true;
     }
 
     private void extractStubs(TargetVM targetVM,
@@ -198,6 +201,7 @@ public class IntrinsicStubProcessor extends AbstractProcessor {
         if (getAnnotation(method, nodeIntrinsic.asType()) == null) {
             String msg = String.format("methods annotated with %s must also be annotated with %s", annotation, nodeIntrinsic);
             env().getMessager().printMessage(Diagnostic.Kind.ERROR, msg, method, annotation);
+            malformedInput = true;
         }
         RuntimeCheckedFlagsMethod rtc = findRuntimeCheckedFlagsVariant(this, source, method, annotation);
         for (AnnotationMirror generateStubAnnotationValue : generateStubAnnotations) {
@@ -232,6 +236,7 @@ public class IntrinsicStubProcessor extends AbstractProcessor {
         processor.env().getMessager().printMessage(Diagnostic.Kind.ERROR, method + ": Could not find runtime checked flags variant. " +
                         "For every method annotated with @GenerateStub, a second @NodeIntrinsic method with the same signature + an additional @ConstantNodeParameter EnumSet<CPUFeature> parameter for runtime checked CPU flags is required.",
                         method, annotation);
+        malformedInput = true;
         return null;
     }
 
@@ -298,7 +303,9 @@ public class IntrinsicStubProcessor extends AbstractProcessor {
                                         "jdk.graal.compiler.debug.GraalError",
                                         "org.graalvm.nativeimage.ImageSingletons",
                                         "java.util.EnumSet",
-                                        "jdk.vm.ci.code.Architecture"));
+                                        "jdk.vm.ci.code.Architecture",
+                                        "jdk.vm.ci.aarch64.AArch64",
+                                        "jdk.vm.ci.amd64.AMD64"));
                         break;
                 }
                 for (GenerateStubClass genClass : classes) {
@@ -318,9 +325,9 @@ public class IntrinsicStubProcessor extends AbstractProcessor {
                     }
                 }
                 out.printf("\n");
-                out.printf("public class %s", genClassName);
+                out.printf("public class %s ", genClassName);
                 if (targetVM == TargetVM.hotspot) {
-                    out.printf(" extends SnippetStub ");
+                    out.printf("extends SnippetStub ");
                 }
                 out.printf("{\n");
                 if (targetVM == TargetVM.hotspot) {
@@ -328,6 +335,9 @@ public class IntrinsicStubProcessor extends AbstractProcessor {
                     out.printf("    public %s(OptionValues options, HotSpotProviders providers, HotSpotForeignCallLinkage linkage) {\n", genClassName);
                     out.printf("        super(linkage.getDescriptor().getName(), options, providers, linkage);\n");
                     out.printf("    }\n");
+                } else {
+                    out.printf("    @SuppressWarnings(\"unused\") private static final EnumSet<AMD64.CPUFeature> EMPTY_CPU_FEATURES_AMD64 = EnumSet.noneOf(AMD64.CPUFeature.class);\n");
+                    out.printf("    @SuppressWarnings(\"unused\") private static final EnumSet<AArch64.CPUFeature> EMPTY_CPU_FEATURES_AARCH64 = EnumSet.noneOf(AArch64.CPUFeature.class);\n");
                 }
                 out.printf("\n");
                 for (GenerateStubClass genClass : classes) {
@@ -340,14 +350,14 @@ public class IntrinsicStubProcessor extends AbstractProcessor {
                             out.printf("        Architecture arch = ImageSingletons.lookup(SubstrateTargetDescription.class).arch;\n");
                             out.printf("        if (arch instanceof jdk.vm.ci.amd64.AMD64) {\n");
                             if (featuresGetter.amd64Getter.isEmpty()) {
-                                out.printf("            throw GraalError.shouldNotReachHere(\"not implemented\");\n");
+                                out.printf("            return EMPTY_CPU_FEATURES_AMD64;\n");
                             } else {
                                 out.printf("            return %s.%s();\n", genClass.clazz.getSimpleName(), featuresGetter.amd64Getter);
                             }
                             out.printf("        }\n");
                             out.printf("        if (arch instanceof jdk.vm.ci.aarch64.AArch64) {\n");
                             if (featuresGetter.aarch64Getter.isEmpty()) {
-                                out.printf("            throw GraalError.shouldNotReachHere(\"not implemented\");\n");
+                                out.printf("            return EMPTY_CPU_FEATURES_AARCH64;\n");
                             } else {
                                 out.printf("            return %s.%s();\n", genClass.clazz.getSimpleName(), featuresGetter.aarch64Getter);
                             }

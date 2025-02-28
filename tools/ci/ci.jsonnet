@@ -1,6 +1,7 @@
 {
   local common = import '../../ci/ci_common/common.jsonnet',
-  local top_level_ci = (import '../../ci/ci_common/common-utils.libsonnet').top_level_ci,
+  local utils = import '../../ci/ci_common/common-utils.libsonnet',
+  local top_level_ci = utils.top_level_ci,
   local devkits = common.devkits,
 
   local tools_common = {
@@ -42,7 +43,7 @@
   },
 
   local tools_javadoc = tools_common + common_guard + {
-    name: "gate-tools-javadoc",
+    name: "gate-tools-javadoc-" + self.jdk_name,
     run: [
       ["mx", "build"],
       ["mx", "javadoc"],
@@ -80,11 +81,11 @@
     notify_groups:: ["tools"],
   },
 
-  builds: [
+  local _builds = [
     common.linux_amd64   + common.oraclejdkLatest + tools_gate,
     common.linux_amd64   + common.oraclejdk21 + tools_gate,
 
-    common.linux_amd64   + common.oraclejdk21 + tools_javadoc,
+    common.linux_amd64   + common.oraclejdkLatest + tools_javadoc,
     common.linux_amd64   + common.oraclejdk21 + tools_coverage_weekly,
     common.linux_aarch64 + common.labsjdkLatest   + tools_weekly,
     common.linux_aarch64 + common.labsjdk21   + tools_weekly,
@@ -95,4 +96,6 @@
     common.darwin_amd64  + common.oraclejdkLatest + tools_weekly,
     common.darwin_amd64  + common.oraclejdk21 + tools_weekly,
   ],
+
+  builds: utils.add_defined_in(_builds, std.thisFile),
 }
